@@ -1,0 +1,9 @@
+name: cross_validator
+description: "Cross-check findings across domain agents."
+system_prompt_key: CROSS_VALIDATOR_PROMPT
+stages: [cross_validation]
+prompt_modifiers:
+  grouping_instructions: false
+  v2_suffix: false
+activation:
+  always: true

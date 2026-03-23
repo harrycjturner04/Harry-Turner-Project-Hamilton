@@ -1,0 +1,8 @@
+# Installed separately AFTER requirements.txt to avoid PyTorch index intercepting
+# packages like `requests` from PyPI:
+#   uv pip install -r Environments/requirements-torch.txt
+#
+# Bundles CUDA 12.8 libraries (compatible with Hamilton's system CUDA 12.9.1).
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.5.0

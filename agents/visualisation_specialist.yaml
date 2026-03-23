@@ -1,0 +1,12 @@
+name: visualisation_specialist
+description: "Plot design and visual communication specialist; advises on chart type selection, colour palettes, and statistical annotations."
+system_prompt_key: VISUALISATION_SPECIALIST_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: false
+  v2_suffix: false
+activation:
+  # Active when scientific visual review is enabled
+  requires_config:
+    visual_review_mode: "scientific"
+extended: true  # Phase C — only loaded when expert_library: "extended"

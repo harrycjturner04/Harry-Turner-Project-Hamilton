@@ -1,0 +1,13 @@
+name: bioprocess_analyst
+description: "Batch process data analysis: upstream/downstream stages, yield metrics, process parameters."
+system_prompt_key: BIOPROCESS_ANALYST_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: true
+  v2_suffix: true
+activation:
+  column_roles: [ordinal_stage, continuous_measurement]
+  semantic_purposes: [process_phase]
+  domain_keywords: [yield, titre, titer, viability, harvest, fermentation, purification, downstream, upstream, batch]
+  min_confidence: 0.2
+extended: true  # Phase C — only loaded when expert_library: "extended"

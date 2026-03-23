@@ -1,0 +1,12 @@
+name: chromatography_expert
+description: "HPLC/SEC/IEX chromatographic analysis."
+system_prompt_key: CHROMATOGRAPHY_EXPERT_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: true
+  v2_suffix: true
+activation:
+  domain_keywords: [retention_time, peak_area, absorbance, mau, uv_280, uv_260, elution, fraction]
+  column_roles: [continuous_measurement]
+  semantic_purposes: [process_phase, experimental_condition]
+  min_confidence: 0.2

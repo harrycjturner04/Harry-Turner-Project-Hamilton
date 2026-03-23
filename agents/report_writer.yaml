@@ -1,0 +1,9 @@
+name: report_writer
+description: "Write narrative reports from artifacts."
+system_prompt_key: REPORT_WRITER_PROMPT
+stages: [report]
+prompt_modifiers:
+  grouping_instructions: false
+  v2_suffix: false
+activation:
+  always: true

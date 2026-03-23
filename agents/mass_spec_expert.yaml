@@ -1,0 +1,12 @@
+name: mass_spec_expert
+description: "LC-MS intact mass and charge-state analysis."
+system_prompt_key: MASS_SPEC_EXPERT_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: true
+  v2_suffix: true
+activation:
+  domain_keywords: [charge_state, mz, m_z, mass, dalton, spectrum, deconvol, intact_mass]
+  column_roles: [continuous_measurement]
+  semantic_purposes: [experimental_condition]
+  min_confidence: 0.2

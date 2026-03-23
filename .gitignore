@@ -1,0 +1,40 @@
+# ignore the .env file
+.env
+
+# ignore the slurm-*.out files
+slurm-*.out
+
+# ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ignore logs
+*.log
+logs/
+*.out
+*.err
+
+# ignore Data files
+Data/
+Database/
+Cleaned_Data/
+
+# ignore outputs
+Outputs/
+coding_workspace/
+.deepeval/
+
+
+# ignore test files
+tests/
+
+Zz_Random/
+.claude/
+
+*.pdf
+knowledge_base/
+
+# Evaluation framework
+evaluation_config.yaml
+Evaluation/

@@ -1,0 +1,13 @@
+name: statistical_modeler
+description: "Advanced statistical modelling: mixed-effects models, design of experiments, survival analysis, multivariate techniques."
+system_prompt_key: STATISTICAL_MODELER_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: true
+  v2_suffix: true
+activation:
+  column_roles: [continuous_measurement, categorical_group]
+  semantic_purposes: [experimental_unit, experimental_condition]
+  min_numeric_columns: 4
+  min_rows: 50
+extended: true  # Phase C — only loaded when expert_library: "extended"

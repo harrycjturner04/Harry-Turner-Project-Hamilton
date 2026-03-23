@@ -1,0 +1,11 @@
+name: statistical_analyst
+description: "Descriptive stats, correlations, outliers, group comparisons."
+system_prompt_key: STATISTICAL_ANALYST_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: true
+  v2_suffix: true
+activation:
+  column_roles: [continuous_measurement, categorical_group]
+  semantic_purposes: [experimental_unit, experimental_condition]
+  min_numeric_columns: 2

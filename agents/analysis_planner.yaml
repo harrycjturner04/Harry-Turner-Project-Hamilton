@@ -1,0 +1,10 @@
+name: analysis_planner
+description: "Analysis strategy planner; recommends diverse plot types and analytical angles; also handles EDA when domain is unclear."
+system_prompt_key: ANALYSIS_PLANNER_PROMPT
+stages: [analysis]
+prompt_modifiers:
+  grouping_instructions: false
+  v2_suffix: false
+activation:
+  # Always included in analysis stage — orchestrates the plan
+  always: true

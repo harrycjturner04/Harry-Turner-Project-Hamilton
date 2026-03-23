@@ -1,0 +1,11 @@
+name: data_cleaner
+description: "Preprocess raw biologics data."
+system_prompt_key: DATA_CLEANER_PROMPT
+stages: [cleaning]
+# No grouping instructions or v2 suffix injected for cleaning
+prompt_modifiers:
+  grouping_instructions: false
+  v2_suffix: false
+activation:
+  # Always active for cleaning stage — no conditions
+  always: true

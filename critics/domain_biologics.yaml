@@ -1,0 +1,45 @@
+# Domain-specific analytical expectations for the AnalyticalDepthCritic.
+# WP-C3a: Loaded by the depth critic based on detect_data_domains() output.
+# Add new domains by creating domain_<name>.yaml files in this directory.
+
+expectations:
+  chromatography:
+    required_analyses:
+      - columns: [UV_1_280_ml, volume_ml]
+        analysis: "peak_detection"
+        description: "Detect and characterise peaks in UV280 trace"
+      - columns: [chromatography_stage, run_no]
+        analysis: "run_to_run_comparison"
+        description: "Compare key metrics across runs and stages"
+      - columns: [UV_1_280_ml, UV_1_260_ml]
+        analysis: "purity_ratio"
+        description: "Compute A280/A260 ratio for purity assessment"
+    interpretation_vocabulary:
+      - "column degradation"
+      - "resin lifetime"
+      - "binding capacity"
+      - "aggregate"
+      - "monomer"
+      - "resolution"
+      - "plate count"
+      - "asymmetry factor"
+      - "peak tailing"
+      - "process deviation"
+
+  mass_spectrometry:
+    required_analyses:
+      - columns: [Observed_m/z, Expected_mass_(Da)]
+        analysis: "mass_accuracy"
+        description: "Compute mass accuracy (ppm deviation) for each species"
+      - columns: [charge_state]
+        analysis: "charge_envelope"
+        description: "Analyse charge state distribution and deconvolution"
+    interpretation_vocabulary:
+      - "glycoform"
+      - "post-translational modification"
+      - "deamidation"
+      - "oxidation"
+      - "mass shift"
+      - "charge envelope"
+      - "intact mass"
+      - "sequence variant"
