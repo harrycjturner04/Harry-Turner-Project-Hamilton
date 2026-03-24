@@ -220,10 +220,11 @@ pipeline:
   constraints:
     preserve_columns: [run_no, run, chromatography_stage, Sample_Code, column, Fraction_number, charge_state, Spectrum_type]
     no_aggregation_across: [run_no]
-    grouping_columns: [run_no, chromatography_stage, Sample_Code]
+    grouping_columns: [run_no, column]
+    grouping_extend_when_present: [chromatography_stage, Sample_Code]
 
   run_config:
-    run_label: "WP-1 FULL + CONVERGENT"
+    run_label: "WP-1 FULL + CONVERGENT + Scientific"
     prompt_version: "v2"
     content_validation: true
     min_cross_val_claims: 5
@@ -239,10 +240,19 @@ pipeline:
     iteration_strategy: "convergent"
     convergence_threshold: 0.05
     convergence_target: 0.85
-    visual_review_mode: "basic"
-    require_figure_references: false
+    visual_review_mode: "scientific"
+    require_figure_references: true
     expert_library: "baseline"
     agent_definitions_dir: "agents/"
     payload_char_limit_per_file: 12000
     payload_char_limit_global: 15000
+    # WP-C: Critic architecture toggles
+    critic_structural: true             # structural gate (pure Python)
+    critic_content: true                # LLM content evaluator
+    critic_visual: true                 # VLM plot reviewer
+    critic_analytical_depth: true       # WP-C3a: Python heuristic + LLM depth analysis
+    critic_execution: false             # WP-C3b: execution correctness (enable after validation)
+    # WP-C2: Targeted refinement
+    targeted_refinement: true           # enable PLOT_FIX / FINDING_FIX / GAP_FILL paths
+    refinement_cascade: false           # escalation cascade (enable after validation)
 ```

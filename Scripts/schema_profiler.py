@@ -19,7 +19,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from itertools import combinations
+from itertools import combinations, product
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -42,8 +42,10 @@ _METADATA_TEXT_MIN_MEDIAN_LEN = 20  # median string length above this → metada
 _MIN_GROUPS = 3                     # minimum useful group count
 _MAX_GROUPS = 200                   # maximum before grouping becomes unwieldy
 _MIN_ROWS_PER_GROUP = 5             # each group should have at least this many rows
-_IDEAL_GROUP_RANGE = (5, 50)        # preferred range for group count scoring
+_IDEAL_GROUP_RANGE = (5, 100)       # preferred range for group count scoring
 _MAX_GROUPING_COMBO_COLUMNS = 3     # max columns in a compound grouping key
+_CANDIDATE_NULL_CEILING = 0.8       # columns below this null% are eligible as grouping candidates
+_COVERAGE_PENALTY_WEIGHT = 0.15     # score penalty weight for partial-coverage grouping columns
 
 # Ordinal detection — patterns indicating ordered/sequential values
 _ORDINAL_PATTERNS = [
@@ -188,6 +190,8 @@ class DataProfile:
     technique_recommendations: List[TechniqueRecommendation] = field(default_factory=list)
     # Phase A+: Dimensional structure (relationships, hierarchy, analysis contexts)
     dimensional_structure: Optional[DimensionalStructure] = None
+    # Profiler warnings (e.g. context override rejected)
+    profiler_warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialise to dict for JSON output and payload injection."""
@@ -216,13 +220,15 @@ class DataProfile:
             role_map.setdefault(col.role, []).append(col.name)
         result["column_roles"] = role_map
 
-        # Top-3 grouping candidates (compact)
-        for gc in self.grouping_candidates[:3]:
+        # Top-5 grouping candidates (compact) — expanded from 3 so
+        # agents see alternative groupings beyond the recommended one.
+        for gc in self.grouping_candidates[:5]:
             result["grouping_candidates"].append({
                 "columns": gc.columns,
                 "group_count": gc.group_count,
                 "median_group_size": round(gc.median_group_size, 1),
                 "score": round(gc.score, 3),
+                "rows_covered_pct": gc.rows_covered_pct,
             })
 
         if self.recommended_grouping:
@@ -231,6 +237,10 @@ class DataProfile:
                 "group_count": self.recommended_grouping.group_count,
                 "score": round(self.recommended_grouping.score, 3),
             }
+
+        # Profiler warnings (context override rejection, partial override notes)
+        if self.profiler_warnings:
+            result["profiler_warnings"] = self.profiler_warnings
 
         # Phase A+ — dimensional structure (under dedicated key for trimming)
         if self.dimensional_structure:
@@ -509,6 +519,11 @@ def _evaluate_grouping(
     """Evaluate a specific set of columns as a compound grouping key.
 
     Returns None if the grouping is invalid (too few/many groups, all NaN, etc.).
+
+    Coverage-aware: columns with partial null values are evaluated on the
+    subset of rows where they are present.  The coverage percentage is
+    factored into the quality score so that higher-null groupings are
+    ranked lower (not eliminated) compared to fully-populated ones.
     """
     # Check all columns exist
     missing = [c for c in columns if c not in df.columns]
@@ -538,6 +553,14 @@ def _evaluate_grouping(
 
     score = _score_grouping(group_count, min_size, median_size, cv, rows_covered_pct)
 
+    # Apply coverage penalty for partial-null grouping columns so that
+    # higher-coverage groupings are preferred when scores are close, but
+    # analytically valuable columns with moderate nulls are not discarded.
+    max_col_null = max(df[c].isna().mean() for c in columns)
+    if max_col_null > 0.1:
+        coverage_penalty = _COVERAGE_PENALTY_WEIGHT * max_col_null
+        score = round(max(score - coverage_penalty, 0.0), 4)
+
     return GroupingCandidate(
         columns=columns,
         group_count=group_count,
@@ -558,12 +581,20 @@ def _infer_grouping_candidates(
     Only considers columns classified as categorical_group or ordinal_stage.
     Evaluates all 1-, 2-, and 3-column combinations and returns them
     sorted by score (descending).
+
+    When semantic purposes are available on the column profiles, a
+    multiplier is applied so that groupings covering analytically
+    meaningful dimensions rank higher than statistically equivalent
+    but shallow alternatives.
     """
-    # Candidate columns: categorical_group and ordinal_stage only
+    # Candidate columns: categorical_group and ordinal_stage only.
+    # Use relaxed null ceiling (_CANDIDATE_NULL_CEILING) so that columns
+    # with moderate missingness are still evaluated as grouping candidates;
+    # the coverage penalty in _evaluate_grouping() handles score adjustment.
     candidate_cols = [
         cp.name for cp in column_profiles
         if cp.role in ("categorical_group", "ordinal_stage")
-        and cp.null_pct < 0.5  # skip columns that are mostly null
+        and cp.null_pct < _CANDIDATE_NULL_CEILING
     ]
 
     if not candidate_cols:
@@ -576,12 +607,164 @@ def _infer_grouping_candidates(
         for combo in combinations(candidate_cols, n_cols):
             gc = _evaluate_grouping(df, list(combo))
             if gc is not None:
+                # Apply semantic quality multiplier if purposes are classified
+                mult = _semantic_quality_multiplier(list(combo), column_profiles)
+                if mult != 1.0:
+                    gc.score = round(min(gc.score * mult, 1.0), 4)
                 candidates.append(gc)
 
     # Sort by score descending
     candidates.sort(key=lambda c: c.score, reverse=True)
 
     return candidates
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Semantic grouping composition
+# ──────────────────────────────────────────────────────────────────────
+
+# Weights for each semantic purpose when scoring grouping compositions.
+# Higher weight = more analytically meaningful for the primary per_group
+# output.  Process phases and experimental conditions capture the
+# scientific variation; experimental units (runs) are important but can
+# serve as a secondary comparison dimension; technical replicates are
+# the least informative for primary grouping.
+_SEMANTIC_GROUPING_WEIGHTS: Dict[str, int] = {
+    "process_phase": 3,
+    "experimental_condition": 3,
+    "experimental_unit": 2,
+    "technical_replicate": 1,
+}
+
+# Purposes considered for semantic composition, in evaluation order.
+_SEMANTIC_PURPOSES = list(_SEMANTIC_GROUPING_WEIGHTS.keys())
+
+# Maximum column alternatives to try per purpose (limits combinatorial explosion).
+_MAX_ALTS_PER_PURPOSE = 2
+
+
+def _compose_semantic_grouping(
+    df: pd.DataFrame,
+    col_profiles: List[ColumnProfile],
+) -> Optional[GroupingCandidate]:
+    """Compose a recommended grouping from semantic purposes.
+
+    Mimics how a domain scientist would slice the data: pick the columns
+    that capture the most analytically-distinct dimensions (process phases,
+    experimental conditions, experimental units) while keeping the group
+    count within practical limits.
+
+    Algorithm:
+      1. Collect usable discrete columns per semantic purpose.
+      2. Enumerate all valid compositions (subsets of purposes × column
+         alternatives) and evaluate each via ``_evaluate_grouping``.
+      3. Score each valid composition by the sum of purpose weights
+         (primary) and grouping quality score (tiebreaker).
+      4. Return the highest-scoring composition.
+
+    Returns None if no columns have recognised semantic purposes.
+    """
+    # ── Collect usable columns per purpose ──
+    # Use relaxed null ceiling so analytically important columns with
+    # moderate missingness participate in semantic composition; the
+    # coverage penalty in _evaluate_grouping() adjusts scores.
+    purpose_cols: Dict[str, List[ColumnProfile]] = {}
+    for cp in col_profiles:
+        if (cp.semantic_purpose in _SEMANTIC_GROUPING_WEIGHTS
+                and cp.role in ("categorical_group", "ordinal_stage")
+                and cp.null_pct < _CANDIDATE_NULL_CEILING):
+            purpose_cols.setdefault(cp.semantic_purpose, []).append(cp)
+
+    # Sort each purpose by cardinality descending (most informative first)
+    # and keep only top alternatives to limit search space.
+    for purpose in purpose_cols:
+        purpose_cols[purpose] = sorted(
+            purpose_cols[purpose], key=lambda c: c.cardinality, reverse=True,
+        )[:_MAX_ALTS_PER_PURPOSE]
+
+    available = [p for p in _SEMANTIC_PURPOSES if p in purpose_cols]
+    if not available:
+        return None
+
+    best_gc: Optional[GroupingCandidate] = None
+    best_semantic_score = -1.0
+
+    # Try all subsets of available purposes (from largest to smallest).
+    for n_purposes in range(len(available), 0, -1):
+        for purpose_combo in combinations(available, n_purposes):
+            # Semantic weight of this combination
+            semantic_weight = sum(_SEMANTIC_GROUPING_WEIGHTS[p] for p in purpose_combo)
+
+            # Skip if this combination can't beat what we already have
+            if best_gc is not None and semantic_weight < best_semantic_score - 1.0:
+                continue
+
+            # Try all column alternatives for the selected purposes
+            alt_lists = [
+                [cp.name for cp in purpose_cols[p]] for p in purpose_combo
+            ]
+            for col_combo in product(*alt_lists):
+                gc = _evaluate_grouping(df, list(col_combo))
+                if gc is None:
+                    continue
+                # Composite score: semantic weight (integer) + quality (0-1)
+                composite = semantic_weight + gc.score
+                if composite > best_semantic_score:
+                    best_semantic_score = composite
+                    best_gc = gc
+
+    if best_gc is not None:
+        logger.info(
+            "Semantic grouping composed: %s (%d groups, score=%.3f)",
+            best_gc.columns, best_gc.group_count, best_gc.score,
+        )
+    return best_gc
+
+
+def _semantic_quality_multiplier(
+    columns: List[str],
+    col_profiles: List[ColumnProfile],
+) -> float:
+    """Return a scoring multiplier (0.7 – 1.5) based on the semantic
+    quality of the columns in a grouping candidate.
+
+    Groupings that span multiple analytically-distinct purposes get a
+    bonus; groupings that use only low-value purposes (e.g. technical
+    replicate alone) get a penalty.  The ceiling is set high enough
+    (1.5 for 3+ purposes) that a rich multi-dimensional grouping can
+    outscore a statistically cleaner but analytically shallow one.
+    """
+    profile_map = {cp.name: cp for cp in col_profiles}
+    purposes_present: set[str] = set()
+    for col in columns:
+        cp = profile_map.get(col)
+        if cp and cp.semantic_purpose in _SEMANTIC_GROUPING_WEIGHTS:
+            purposes_present.add(cp.semantic_purpose)
+
+    if not purposes_present:
+        return 1.0  # no semantic info → neutral
+
+    weight_sum = sum(_SEMANTIC_GROUPING_WEIGHTS.get(p, 0) for p in purposes_present)
+    n_purposes = len(purposes_present)
+
+    # Base multiplier from number of purposes covered.
+    # Ceiling raised to 1.5 for 3+ purposes so that analytically rich
+    # groupings can offset group-count scoring penalties.
+    if n_purposes >= 3:
+        multiplier = 1.5
+    elif n_purposes == 2:
+        multiplier = 1.25
+    elif weight_sum >= 3:
+        # Single high-value purpose (process_phase or condition)
+        multiplier = 1.10
+    elif weight_sum >= 2:
+        # Single moderate purpose (experimental_unit)
+        multiplier = 1.0
+    else:
+        # Only technical_replicate
+        multiplier = 0.7
+
+    return multiplier
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1487,6 +1670,7 @@ def _recommend_techniques(profile: DataProfile) -> List[TechniqueRecommendation]
 def profile_dataset(
     parquet_path: str | Path,
     context_grouping_columns: Optional[List[str]] = None,
+    context_extend_columns: Optional[List[str]] = None,
     mode: str = "roles_only",
 ) -> DataProfile:
     """Profile a cleaned dataset and return a structured DataProfile.
@@ -1496,6 +1680,10 @@ def profile_dataset(
         context_grouping_columns: Grouping columns from context.md (override).
             If provided, these take precedence over inferred grouping but
             inferred candidates are still computed for reference.
+        context_extend_columns: Additional grouping columns from context.md
+            (``grouping_extend_when_present``).  These are appended to
+            ``context_grouping_columns`` when the data supports them
+            (i.e. when they exist and have < _CANDIDATE_NULL_CEILING nulls).
         mode: Profiling depth — "roles_only" (Phase A) or "full" (Phase A+B).
 
     Returns:
@@ -1513,32 +1701,36 @@ def profile_dataset(
     row_count = len(df)
     col_count = len(df.columns)
 
+    # Stash extend columns for later — they are tried *after* the base
+    # context grouping is validated so that a failing extension never
+    # blocks acceptance of the core grouping the user specified.
+    _extend_columns: List[str] = []
+    if context_extend_columns and context_grouping_columns:
+        for ext_col in context_extend_columns:
+            if ext_col in df.columns and ext_col not in context_grouping_columns:
+                null_pct = df[ext_col].isna().mean()
+                if null_pct < _CANDIDATE_NULL_CEILING:
+                    _extend_columns.append(ext_col)
+                    logger.info(
+                        "Context extension candidate '%s' eligible "
+                        "(%.1f%% null, below ceiling %.0f%%)",
+                        ext_col, null_pct * 100, _CANDIDATE_NULL_CEILING * 100,
+                    )
+                else:
+                    logger.info(
+                        "Skipping context extension column '%s' "
+                        "(%.1f%% null, above ceiling %.0f%%)",
+                        ext_col, null_pct * 100, _CANDIDATE_NULL_CEILING * 100,
+                    )
+
     # Phase A: Classify columns
     col_profiles: List[ColumnProfile] = []
     for col_name in df.columns:
         cp = _profile_column(df[col_name], col_name, row_count)
         col_profiles.append(cp)
 
-    # Phase A: Infer grouping candidates
-    grouping_candidates = _infer_grouping_candidates(df, col_profiles)
-
-    # Determine recommended grouping
-    recommended: Optional[GroupingCandidate] = None
-    if context_grouping_columns:
-        # Context override: evaluate the specified columns as a grouping
-        override_gc = _evaluate_grouping(df, context_grouping_columns)
-        if override_gc is not None:
-            recommended = override_gc
-        else:
-            logger.warning(
-                "Context grouping_columns %s produced invalid grouping "
-                "(too few/many groups or all-NaN). Falling back to inferred.",
-                context_grouping_columns,
-            )
-    if recommended is None and grouping_candidates:
-        recommended = grouping_candidates[0]
-
     # Phase A+: Relationship graph, semantic purposes, dimensional structure
+    # (moved before grouping so semantic multiplier and composition are available)
     relationships = _build_relationship_graph(df, col_profiles)
 
     # Semantic purpose classification (two-pass)
@@ -1551,6 +1743,122 @@ def profile_dataset(
             logger.info(
                 "  %s → %s (%s)", cp.name, cp.semantic_purpose, cp.role,
             )
+
+    # Phase A: Infer grouping candidates (now with semantic multiplier)
+    grouping_candidates = _infer_grouping_candidates(df, col_profiles)
+
+    # Compose a semantic grouping from dimensional purposes
+    semantic_gc = _compose_semantic_grouping(df, col_profiles)
+
+    # Determine recommended grouping.
+    # Priority: (1) full context override, (1b) partial context override,
+    #           (2) semantic composition, (3) top inferred
+    recommended: Optional[GroupingCandidate] = None
+    _context_override_rejected: Optional[str] = None
+    _partial_override_notes: List[str] = []
+    if context_grouping_columns:
+        # Context override: evaluate the specified columns as a grouping
+        override_gc = _evaluate_grouping(df, context_grouping_columns)
+        if override_gc is not None:
+            recommended = override_gc
+            logger.info(
+                "Using context.md grouping override: %s (%d groups)",
+                context_grouping_columns, override_gc.group_count,
+            )
+            # Try extending with additional columns from context.md.
+            # Add one at a time and keep only those that still pass.
+            if _extend_columns:
+                extended = list(context_grouping_columns)
+                for ext_col in _extend_columns:
+                    trial = extended + [ext_col]
+                    trial_gc = _evaluate_grouping(df, trial)
+                    if trial_gc is not None:
+                        extended = trial
+                        recommended = trial_gc
+                        logger.info(
+                            "Extended override with '%s': %s (%d groups, "
+                            "coverage=%.1f%%)",
+                            ext_col, extended, trial_gc.group_count,
+                            trial_gc.rows_covered_pct,
+                        )
+                    else:
+                        _partial_override_notes.append(
+                            f"Extension column '{ext_col}' was eligible "
+                            f"(null < {_CANDIDATE_NULL_CEILING*100:.0f}%) "
+                            f"but extending the grouping to {trial} failed "
+                            f"evaluation. Using {extended} instead. "
+                            f"Consider sub-group analysis on '{ext_col}' within "
+                            f"the rows where it is non-null."
+                        )
+                        logger.info(
+                            "Extension column '%s' failed evaluation, keeping %s",
+                            ext_col, extended,
+                        )
+        else:
+            # Diagnose why the override failed
+            missing = [c for c in context_grouping_columns if c not in df.columns]
+            high_null = [
+                c for c in context_grouping_columns
+                if c in df.columns and df[c].isna().mean() > _CANDIDATE_NULL_CEILING
+            ]
+            usable = [
+                c for c in context_grouping_columns
+                if c in df.columns and c not in missing and c not in high_null
+            ]
+            reasons = []
+            if missing:
+                reasons.append(f"columns not found: {missing}")
+            if high_null:
+                reasons.append(f"columns >{_CANDIDATE_NULL_CEILING*100:.0f}%% null: {high_null}")
+
+            # Attempt partial override: use the usable subset of context
+            # columns so that the user's intent is honoured as far as
+            # the data allows.
+            if usable and len(usable) < len(context_grouping_columns):
+                partial_gc = _evaluate_grouping(df, usable)
+                if partial_gc is not None:
+                    recommended = partial_gc
+                    dropped = [c for c in context_grouping_columns if c not in usable]
+                    _partial_override_notes.append(
+                        f"Context requested grouping by {context_grouping_columns} "
+                        f"but columns {dropped} were unusable ({'; '.join(reasons)}). "
+                        f"Using partial override: {usable} "
+                        f"({partial_gc.group_count} groups, {partial_gc.rows_covered_pct}% coverage). "
+                        f"For the subset of rows where {dropped} are present, "
+                        f"consider extending the grouping to include them."
+                    )
+                    logger.warning(
+                        "Context grouping_columns %s partial override: using %s "
+                        "(dropped %s: %s).",
+                        context_grouping_columns, usable, dropped,
+                        "; ".join(reasons),
+                    )
+
+            if recommended is None:
+                if not reasons:
+                    reasons.append("too few/many groups or insufficient data")
+                _context_override_rejected = (
+                    f"context.md requested grouping by {context_grouping_columns} "
+                    f"but override failed ({'; '.join(reasons)})"
+                )
+                logger.warning(
+                    "Context grouping_columns %s override rejected: %s. "
+                    "Falling back to semantic inference.",
+                    context_grouping_columns, "; ".join(reasons),
+                )
+
+    if recommended is None and semantic_gc is not None:
+        recommended = semantic_gc
+        logger.info(
+            "Using semantic grouping: %s (%d groups, score=%.3f)",
+            semantic_gc.columns, semantic_gc.group_count, semantic_gc.score,
+        )
+    elif recommended is None and grouping_candidates:
+        recommended = grouping_candidates[0]
+        logger.info(
+            "Using top inferred grouping: %s (%d groups, score=%.3f)",
+            recommended.columns, recommended.group_count, recommended.score,
+        )
 
     # Build dimensional structure
     dim_structure = _build_dimensional_structure(df, col_profiles, relationships)
@@ -1573,6 +1881,10 @@ def profile_dataset(
         datetime_cols=[cp.name for cp in col_profiles if cp.role == "datetime"],
         constant_cols=[cp.name for cp in col_profiles if cp.role == "constant"],
         dimensional_structure=dim_structure,
+        profiler_warnings=(
+            ([_context_override_rejected] if _context_override_rejected else [])
+            + _partial_override_notes
+        ),
     )
 
     # Phase B: Distribution profiling and technique recommendations
@@ -1630,6 +1942,12 @@ def build_profile_instructions(profile: DataProfile) -> str:
     """
     lines: List[str] = []
     ds = profile.dimensional_structure
+
+    # ── Profiler warnings (e.g. context override rejection) ──
+    if profile.profiler_warnings:
+        for w in profile.profiler_warnings:
+            lines.append(f"WARNING: {w}")
+        lines.append("")
 
     lines.append("DATA PROFILE (from schema profiler):")
     lines.append(f"Dataset: {profile.row_count} rows, {profile.column_count} columns.")
@@ -1718,6 +2036,11 @@ def build_profile_instructions(profile: DataProfile) -> str:
     # ── Analysis contexts (multi-context grouping guidance) ──
     if ds and ds.analysis_contexts:
         lines.append("ANALYSIS CONTEXTS — use the appropriate context for each analysis question:")
+        lines.append("  These are NOT optional extras; they represent analytically distinct ways")
+        lines.append("  to slice the data. If a question involves process trends across stages,")
+        lines.append("  use the PROCESS_TREND context. If comparing conditions, use CONDITION_COMPARISON.")
+        lines.append("  Extend the default grouping when your analysis question requires finer")
+        lines.append("  discrimination (e.g., per-stage or per-sample breakdown).")
         for i, ac in enumerate(ds.analysis_contexts, 1):
             key_str = ", ".join(ac.group_by)
             lines.append(
@@ -1738,14 +2061,34 @@ def build_profile_instructions(profile: DataProfile) -> str:
         lines.append("DEFAULT DATA GROUPING (for per_group output structure):")
         lines.append(f"  Group by the compound key: ({key_str}).")
         lines.append(f"  This produces {rg.group_count} analytical groups "
-                      f"(median size: {rg.median_group_size} rows).")
+                      f"(median size: {rg.median_group_size} rows, "
+                      f"coverage: {rg.rows_covered_pct}%).")
         lines.append(f"  Store per-group results using compound keys joined by '__':")
         lines.append(f"    e.g. \"{compound_example}\"")
         lines.append("  Use a 'per_group' key in analysis_summary.json.")
         if ds and ds.analysis_contexts:
-            lines.append("  You MAY use other analysis contexts above for specific questions,")
-            lines.append("  but the default grouping defines the per_group output structure.")
+            lines.append("  You SHOULD use analysis contexts above when your analysis question")
+            lines.append("  requires additional grouping dimensions (e.g., adding process_phase")
+            lines.append("  for stage-level trends). The default grouping is the MINIMUM;")
+            lines.append("  extend it when the data structure warrants finer discrimination.")
         lines.append("")
+
+        # ── Alternative grouping candidates (top 5) ──
+        alternatives = [
+            gc for gc in profile.grouping_candidates
+            if gc.columns != rg.columns
+        ][:4]
+        if alternatives:
+            lines.append("ALTERNATIVE GROUPING CANDIDATES (ranked by quality):")
+            for gc in alternatives:
+                alt_str = ", ".join(gc.columns)
+                lines.append(
+                    f"  ({alt_str}): {gc.group_count} groups, "
+                    f"score={gc.score:.3f}, coverage={gc.rows_covered_pct}%"
+                )
+            lines.append("  Consider these if the default grouping is too coarse for")
+            lines.append("  your analysis question or if you need finer subgroups.")
+            lines.append("")
     else:
         lines.append("GROUPING GUIDANCE:")
         lines.append("  No strong grouping structure detected in this dataset.")

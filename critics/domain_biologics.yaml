@@ -1,19 +1,32 @@
 # Domain-specific analytical expectations for the AnalyticalDepthCritic.
 # WP-C3a: Loaded by the depth critic based on detect_data_domains() output.
 # Add new domains by creating domain_<name>.yaml files in this directory.
+#
+# detection_keywords:  column-name substrings used by the critic's fallback
+#                      domain detection when domain_hints are absent from the
+#                      analysis summary.  Matched case-insensitively against
+#                      the cleaned dataset's column names.
+# required_analyses:   analysis types the critic expects to find mentioned in
+#                      the findings text.  Each entry needs only 'analysis'
+#                      (matched in findings) and 'description' (human context).
+# interpretation_vocabulary: domain terms indicating interpretive depth.
 
 expectations:
   chromatography:
+    detection_keywords:
+      - "retention"
+      - "uv"
+      - "mau"
+      - "absorbance"
+      - "elution"
+      - "chromatogram"
     required_analyses:
-      - columns: [UV_1_280_ml, volume_ml]
-        analysis: "peak_detection"
-        description: "Detect and characterise peaks in UV280 trace"
-      - columns: [chromatography_stage, run_no]
-        analysis: "run_to_run_comparison"
+      - analysis: "peak_detection"
+        description: "Detect and characterise peaks in absorbance trace"
+      - analysis: "run_to_run_comparison"
         description: "Compare key metrics across runs and stages"
-      - columns: [UV_1_280_ml, UV_1_260_ml]
-        analysis: "purity_ratio"
-        description: "Compute A280/A260 ratio for purity assessment"
+      - analysis: "purity_ratio"
+        description: "Compute absorbance ratio for purity assessment"
     interpretation_vocabulary:
       - "column degradation"
       - "resin lifetime"
@@ -27,12 +40,17 @@ expectations:
       - "process deviation"
 
   mass_spectrometry:
+    detection_keywords:
+      - "m/z"
+      - "mass"
+      - "charge"
+      - "dalton"
+      - "spectrum"
+      - "deconvolution"
     required_analyses:
-      - columns: [Observed_m/z, Expected_mass_(Da)]
-        analysis: "mass_accuracy"
+      - analysis: "mass_accuracy"
         description: "Compute mass accuracy (ppm deviation) for each species"
-      - columns: [charge_state]
-        analysis: "charge_envelope"
+      - analysis: "charge_envelope"
         description: "Analyse charge state distribution and deconvolution"
     interpretation_vocabulary:
       - "glycoform"

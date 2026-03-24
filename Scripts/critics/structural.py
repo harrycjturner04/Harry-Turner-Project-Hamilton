@@ -1,14 +1,26 @@
 """StructuralCritic — wraps the existing ``structural_gate()`` from tools.py.
 
-WP-C1: Zero behaviour change.  Delegates to the pure-Python structural gate
-and returns its CheckResult list through the CriticModule interface.
+WP-C1: Zero behaviour change for existing checks.  Delegates to the
+pure-Python structural gate and returns its CheckResult list through
+the CriticModule interface.
+
+Grouping adequacy check (WP-1A): On the analysis stage, compares the
+grouping dimensions used in the analysis_summary against the dimensional
+structure detected by the schema profiler.  Flags as should_fix if
+analytically meaningful dimensions were detected but not used.
 """
 from __future__ import annotations
 
+import logging
 from typing import List, Set
 
-from tools import CheckCategory, CheckResult, structural_gate
+from tools import CheckCategory, CheckResult, Severity, structural_gate
 from critics.base import CriticContext, CriticModule
+
+logger = logging.getLogger("captain_pipeline")
+
+# Semantic purposes considered analytically meaningful for grouping.
+_MEANINGFUL_PURPOSES = {"process_phase", "experimental_condition", "experimental_unit"}
 
 
 class StructuralCritic(CriticModule):
@@ -26,7 +38,7 @@ class StructuralCritic(CriticModule):
         return getattr(ctx.run_config, "critic_structural", True)
 
     def evaluate(self, ctx: CriticContext) -> List[CheckResult]:
-        return structural_gate(
+        checks = structural_gate(
             stage_name=ctx.stage_name,
             expected_paths=ctx.expected_paths,
             output_dir_listing=ctx.listing,
@@ -38,3 +50,80 @@ class StructuralCritic(CriticModule):
                 ctx.run_config, "require_figure_references", False,
             ),
         )
+
+        # Grouping adequacy check — analysis stage only
+        if ctx.stage_name == "analysis":
+            checks.extend(self._check_grouping_adequacy(ctx))
+
+        return checks
+
+    # ── Grouping adequacy (WP-1A) ────────────────────────────────────
+
+    @staticmethod
+    def _check_grouping_adequacy(ctx: CriticContext) -> List[CheckResult]:
+        """Compare used grouping against detected dimensional structure.
+
+        Flags should_fix if the profiler detected analytically meaningful
+        dimensions (process_phase, experimental_condition) that do not
+        appear in the analysis grouping.
+        """
+        results: List[CheckResult] = []
+
+        # Extract data profile from payload (set by captain_pipeline)
+        profile = (ctx.payload or {}).get("data_profile")
+        if not profile or not isinstance(profile, dict):
+            return results
+
+        ds = profile.get("dimensional_structure")
+        if not ds:
+            return results
+
+        rec = profile.get("recommended_grouping")
+        if not rec:
+            return results
+
+        used_cols = set(rec.get("columns", []))
+        dimensions = ds.get("dimensions", [])
+
+        # Collect meaningful dimensions not covered by the grouping
+        missing_dims = []
+        for dim in dimensions:
+            purpose = dim.get("purpose", "")
+            dim_cols = set(dim.get("columns", []))
+            if purpose in _MEANINGFUL_PURPOSES and not dim_cols & used_cols:
+                missing_dims.append(
+                    f"{dim.get('name', '?')} [{purpose}, "
+                    f"{dim.get('cardinality', '?')} levels]"
+                )
+
+        if len(missing_dims) >= 2:
+            results.append(CheckResult(
+                name="grouping_adequacy",
+                passed=False,
+                severity=Severity.SHOULD_FIX,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    f"Grouping uses {sorted(used_cols)} but the profiler "
+                    f"detected {len(missing_dims)} additional meaningful "
+                    f"dimensions not covered: {', '.join(missing_dims)}. "
+                    f"Consider using analysis contexts that include these "
+                    f"dimensions for finer-grained analysis."
+                ),
+                fix_instruction=(
+                    "Extend the grouping key or use the ANALYSIS CONTEXTS "
+                    "from the data profile to include the missing dimensions "
+                    "in at least some analyses (e.g., per-stage trends)."
+                ),
+            ))
+        else:
+            results.append(CheckResult(
+                name="grouping_adequacy",
+                passed=True,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    f"Grouping {sorted(used_cols)} covers the major "
+                    f"analytical dimensions."
+                ),
+            ))
+
+        return results

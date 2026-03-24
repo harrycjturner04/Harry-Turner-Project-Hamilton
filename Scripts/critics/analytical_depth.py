@@ -51,23 +51,21 @@ _CHART_TYPES = {
 }
 
 
-def _load_domain_expectations(domain: str) -> Dict[str, Any]:
-    """Load domain-specific analytical expectations from YAML."""
+def _load_all_domain_expectations() -> Dict[str, Dict[str, Any]]:
+    """Load all domain_*.yaml files and return {domain: expectations_dict}."""
     import yaml
 
-    yaml_paths = [
-        Path(__file__).parent.parent.parent / "critics" / "domain_biologics.yaml",
-        Path(__file__).parent.parent.parent / "critics" / f"domain_{domain}.yaml",
-    ]
-    for yp in yaml_paths:
-        if yp.exists():
-            try:
-                with open(yp) as fh:
-                    data = yaml.safe_load(fh)
-                return data.get("expectations", {}).get(domain, {})
-            except Exception:
-                pass
-    return {}
+    critics_dir = Path(__file__).parent.parent.parent / "critics"
+    all_expectations: Dict[str, Dict[str, Any]] = {}
+    for yp in sorted(critics_dir.glob("domain_*.yaml")):
+        try:
+            with open(yp) as fh:
+                data = yaml.safe_load(fh)
+            for domain, spec in (data.get("expectations") or {}).items():
+                all_expectations[domain] = spec
+        except Exception:
+            pass
+    return all_expectations
 
 
 class AnalyticalDepthCritic(CriticModule):
@@ -105,6 +103,9 @@ class AnalyticalDepthCritic(CriticModule):
 
         # ── Pure-Python heuristic checks ──
 
+        # 0. Grouping adequacy (are the key dimensions covered?)
+        checks.extend(self._check_grouping_adequacy(summary, ctx))
+
         # 1. Missing group comparison
         checks.extend(self._check_group_comparison(findings, per_group))
 
@@ -126,6 +127,122 @@ class AnalyticalDepthCritic(CriticModule):
             checks.extend(llm_checks)
 
         return checks
+
+    def _check_grouping_adequacy(
+        self, summary: Dict[str, Any], ctx: CriticContext,
+    ) -> List[CheckResult]:
+        """Check whether the analysis grouping covers the dataset's key dimensions.
+
+        Loads the data_profile.json produced by the schema profiler and compares
+        the per_group keys against the dimensional structure.  Flags when major
+        analytical dimensions (process_phase, experimental_condition) are absent
+        from the grouping, which usually means the analysis is too coarse.
+        """
+        # Locate data_profile.json (sibling of analysis_summary.json)
+        asp = ctx.payload.get("analysis_summary_path", "")
+        if not asp:
+            return []
+        profile_path = Path(asp).parent / "data_profile.json"
+        if not profile_path.exists():
+            return []
+
+        try:
+            profile_data = json.loads(profile_path.read_text("utf-8"))
+        except Exception:
+            return []
+
+        dim_struct = profile_data.get("dimensional_structure", {})
+        if not dim_struct:
+            return []
+
+        # Important purposes that should appear in the grouping
+        important_purposes = {"process_phase", "experimental_condition", "experimental_unit"}
+
+        # Collect available dimensions and their purposes
+        available_dims: Dict[str, Dict[str, Any]] = {}
+        for dim in dim_struct.get("dimensions", []):
+            purpose = dim.get("semantic_purpose", "uncategorised")
+            if purpose in important_purposes:
+                available_dims[purpose] = {
+                    "name": dim.get("name", ""),
+                    "cardinality": dim.get("cardinality", 0),
+                    "columns": dim.get("columns", [dim.get("name", "")]),
+                }
+
+        if not available_dims:
+            return []  # no classified dimensions → can't assess
+
+        # Determine which columns the analysis actually grouped by
+        per_group = summary.get("per_group", summary.get("per_run_per_stage", {}))
+        grouping_cols = summary.get("descriptive_stats", {}).get("grouping_columns", [])
+
+        # If grouping_columns not in summary, infer from per_group key structure
+        if not grouping_cols and isinstance(per_group, dict) and per_group:
+            # Heuristic: look at which column names appear in the profile
+            # and map them to per_group key structure
+            all_col_names = {
+                c.get("name", "") for c in profile_data.get("columns", [])
+                if c.get("role") in ("categorical_group", "ordinal_stage")
+            }
+            # Check recommended grouping from profile
+            rec_grp = profile_data.get("recommended_grouping")
+            if isinstance(rec_grp, dict):
+                grouping_cols = rec_grp.get("columns", [])
+
+        # Which purposes are covered by the grouping columns?
+        purpose_map = {}
+        for c_info in profile_data.get("columns", []):
+            purpose_map[c_info.get("name", "")] = c_info.get("semantic_purpose", "uncategorised")
+
+        covered_purposes: set = set()
+        for col in grouping_cols:
+            p = purpose_map.get(col, "uncategorised")
+            if p in important_purposes:
+                covered_purposes.add(p)
+
+        # Which important purposes are available but NOT covered?
+        missing = set(available_dims.keys()) - covered_purposes
+
+        if not missing:
+            return [CheckResult(
+                name="depth__grouping_adequacy",
+                passed=True,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=(
+                    f"Grouping covers key dimensions: "
+                    f"{', '.join(sorted(covered_purposes))}"
+                ),
+            )]
+
+        # Build a descriptive failure message
+        missing_details = []
+        for purpose in sorted(missing):
+            dim = available_dims[purpose]
+            missing_details.append(
+                f"{purpose} ({dim['name']}, {dim['cardinality']} levels)"
+            )
+
+        covered_str = ", ".join(sorted(covered_purposes)) if covered_purposes else "none"
+        missing_str = ", ".join(missing_details)
+
+        return [CheckResult(
+            name="depth__grouping_inadequate",
+            passed=False,
+            severity=Severity.MUST_FIX,
+            category=CheckCategory.CONTENT_QUALITY,
+            detail=(
+                f"Analysis grouped by {grouping_cols or '(unknown)'} "
+                f"(covers: {covered_str}) but dataset has important ungrouped "
+                f"dimensions: {missing_str}. The analysis may be too coarse."
+            ),
+            fix_instruction=(
+                f"Revise the grouping to include the missing dimensions. "
+                f"The data has these key analytical dimensions that should be "
+                f"represented in per_group: {missing_str}. "
+                f"Consider grouping by a compound key that includes at least "
+                f"the process phase and experimental condition columns."
+            ),
+        )]
 
     def _check_group_comparison(
         self, findings: List[str], per_group: Dict[str, Any],
@@ -249,33 +366,47 @@ class AnalyticalDepthCritic(CriticModule):
     def _check_domain_expectations(
         self, summary: Dict[str, Any], ctx: CriticContext,
     ) -> List[CheckResult]:
-        """Check domain-specific required analyses."""
-        checks: List[CheckResult] = []
+        """Check domain-specific required analyses.
 
-        # Detect domain from data
-        domain_flags = summary.get("domain_hints", {})
+        Domain detection uses three cascading signals:
+        1. ``domain_hints`` already present in the analysis summary.
+        2. YAML-driven ``detection_keywords`` matched against column names
+           in the cleaned dataset (no hardcoded keywords in Python).
+        3. Falls back gracefully — if neither signal fires, no domain
+           checks are emitted.
+        """
+        checks: List[CheckResult] = []
+        all_expectations = _load_all_domain_expectations()
+        if not all_expectations:
+            return checks
+
+        # --- Resolve domain flags ---
+        domain_flags: Dict[str, bool] = dict(summary.get("domain_hints", {}))
+
         if not domain_flags:
-            # Try to detect from context
+            # Fallback: match YAML detection_keywords against column names
             cleaned_path = ctx.payload.get("cleaned_path", "")
             if cleaned_path and Path(cleaned_path).exists():
                 try:
                     import pandas as pd
                     df = pd.read_parquet(cleaned_path, columns=None)
-                    cols = [c.lower() for c in df.columns]
-                    if any("retention" in c or "uv" in c or "mau" in c for c in cols):
-                        domain_flags["chromatography"] = True
-                    if any("m/z" in c or "mass" in c or "charge" in c for c in cols):
-                        domain_flags["mass_spectrometry"] = True
+                    cols_lower = [c.lower() for c in df.columns]
+                    col_text = " ".join(cols_lower)
+                    for domain, spec in all_expectations.items():
+                        keywords = spec.get("detection_keywords", [])
+                        if any(kw.lower() in col_text for kw in keywords):
+                            domain_flags[domain] = True
                 except Exception:
                     pass
 
+        # --- Evaluate required analyses per detected domain ---
         findings_text = " ".join(str(f) for f in summary.get("findings", [])).lower()
 
         for domain, is_present in domain_flags.items():
             if not is_present:
                 continue
-            expectations = _load_domain_expectations(domain)
-            required = expectations.get("required_analyses", [])
+            spec = all_expectations.get(domain, {})
+            required = spec.get("required_analyses", [])
 
             for req in required:
                 analysis_name = req.get("analysis", "")
@@ -367,20 +498,33 @@ class AnalyticalDepthCritic(CriticModule):
         )
 
         try:
-            from autogen.oai import OpenAIWrapper
+            if self._pipeline._critic_client is not None:
+                # ── OpenRouter path (no local GPU contention) ──
+                response = self._pipeline._critic_client.chat.completions.create(
+                    model=self._pipeline._critic_model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": input_text[:4000]},
+                    ],
+                    temperature=0.0,
+                )
+                reply = response.choices[0].message.content or ""
+            else:
+                # ── Fallback: local vLLM via OpenAIWrapper ──
+                from autogen.oai import OpenAIWrapper
 
-            cfg = self._pipeline._base_config_dict()
-            cfg["temperature"] = 0.0
-            for _entry in cfg.get("config_list", []):
-                _entry["timeout"] = 300
-            client = OpenAIWrapper(**cfg)
-            response = client.create(messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": input_text[:4000]},
-            ])
-            reply = strip_think_tokens(
-                response.choices[0].message.content or ""
-            )
+                cfg = self._pipeline._base_config_dict()
+                cfg["temperature"] = 0.0
+                for _entry in cfg.get("config_list", []):
+                    _entry["timeout"] = 120
+                client = OpenAIWrapper(**cfg)
+                response = client.create(messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": input_text[:4000]},
+                ])
+                reply = strip_think_tokens(
+                    response.choices[0].message.content or ""
+                )
             parsed = parse_json_tolerant(reply)
             if not isinstance(parsed, list):
                 return []

@@ -414,6 +414,14 @@ try:
     _MAX_TOTAL_BAD_PER_SESSION = 15
     _abort_chat = threading.Event()  # set when malformed-loop detected
 
+    # ── Empty-body (JSONDecodeError) circuit breaker ──────────────────
+    # Tracks consecutive LLM calls where ALL retries were exhausted due
+    # to vLLM returning HTTP 200 with an empty response body.  After
+    # _MAX_JSON_ERROR_STREAK such calls, _abort_chat is set so the
+    # conversation terminates cleanly instead of looping forever.
+    _json_error_streak = [0]
+    _MAX_JSON_ERROR_STREAK = 3
+
     @_ft.wraps(_original_oai_create)
     def _patched_oai_create(self, *args, **kwargs):
         # Qwen3.5 chat template requires at least one user message.
@@ -442,8 +450,10 @@ try:
                     kwargs["messages"] = messages
 
         # Retry on transient vLLM errors (503 model loading, 429 rate limit)
+        # and empty-body JSONDecodeError (vLLM returning HTTP 200 with no body).
         _max_retries = 3
         _last_exc = None
+        _last_was_empty_body = False
         for _retry in range(_max_retries):
             try:
                 result = _original_oai_create(self, *args, **kwargs)
@@ -451,18 +461,68 @@ try:
             except Exception as _oai_exc:
                 _exc_str = str(_oai_exc)
                 _is_transient = any(code in _exc_str for code in ("503", "429", "502"))
-                if _is_transient and _retry < _max_retries - 1:
+                _is_empty_body = (
+                    "Expecting value" in _exc_str
+                    or isinstance(_oai_exc, json.JSONDecodeError)
+                )
+                if (_is_transient or _is_empty_body) and _retry < _max_retries - 1:
                     _wait = 2 ** _retry * 5  # 5s, 10s, 20s
+                    _kind = "Empty-body" if _is_empty_body else "Transient"
                     logger.warning(
-                        "Transient vLLM error (attempt %d/%d): %s — retrying in %ds",
-                        _retry + 1, _max_retries, _exc_str[:200], _wait,
+                        "%s vLLM error (attempt %d/%d): %s — retrying in %ds",
+                        _kind, _retry + 1, _max_retries, _exc_str[:200], _wait,
                     )
                     time.sleep(_wait)
                     _last_exc = _oai_exc
+                    _last_was_empty_body = _is_empty_body
                     continue
                 raise
         else:
-            raise _last_exc  # type: ignore[misc]
+            # All retries exhausted — for empty-body errors, return a
+            # synthetic TERMINATE response so the ag2 conversation can
+            # end naturally instead of looping forever.
+            if _last_was_empty_body:
+                _json_error_streak[0] += 1
+                logger.warning(
+                    "All %d retries exhausted on empty-body error "
+                    "(streak %d/%d) — returning synthetic TERMINATE "
+                    "response to unblock conversation",
+                    _max_retries, _json_error_streak[0],
+                    _MAX_JSON_ERROR_STREAK,
+                )
+                if _json_error_streak[0] >= _MAX_JSON_ERROR_STREAK:
+                    _abort_chat.set()
+                    logger.error(
+                        "Circuit breaker: %d consecutive empty-body "
+                        "failures — setting _abort_chat to end "
+                        "conversation cleanly",
+                        _json_error_streak[0],
+                    )
+                from openai.types.chat import (
+                    ChatCompletion,
+                    ChatCompletionMessage,
+                )
+                from openai.types.chat.chat_completion import Choice
+                result = ChatCompletion(
+                    id=f"fallback-empty-body-{_json_error_streak[0]}",
+                    created=int(time.time()),
+                    model="fallback",
+                    object="chat.completion",
+                    choices=[Choice(
+                        index=0,
+                        finish_reason="stop",
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content="TERMINATE",
+                        ),
+                    )],
+                )
+            else:
+                raise _last_exc  # type: ignore[misc]
+
+        # Successful call (either first try or after retries) — reset streak
+        if not _last_was_empty_body:
+            _json_error_streak[0] = 0
 
         try:
             for choice in result.choices:
@@ -1615,11 +1675,18 @@ class CaptainPipeline:
         self.run_config = self.run_plan.run_config
         # Context-driven grouping columns (from context.md constraints block)
         self.grouping_columns: list[str] = self.run_plan.global_constraints.grouping_columns
+        self.grouping_extend_when_present: list[str] = self.run_plan.global_constraints.grouping_extend_when_present
         self.no_aggregation_across: list[str] = self.run_plan.global_constraints.no_aggregation_across
-        # Pre-build the grouping instructions block for prompt injection
-        self._grouping_instructions: str = build_grouping_instructions(
-            self.grouping_columns, self.no_aggregation_across,
-        )
+        # Pre-build the grouping instructions block for prompt injection.
+        # When schema profiling is active, the DATA PROFILE block in the task
+        # payload already contains richer grouping guidance — suppress the
+        # legacy system-message injection to avoid dual/conflicting instructions.
+        if self.run_config.schema_profiling != "disabled":
+            self._grouping_instructions: str = ""
+        else:
+            self._grouping_instructions: str = build_grouping_instructions(
+                self.grouping_columns, self.no_aggregation_across,
+            )
         # Backward-compatible context_bundle for _context_fields()
         self.context_bundle = load_context_text(context_path)
         if self.run_plan.project_description:
@@ -1708,6 +1775,49 @@ class CaptainPipeline:
             logger.warning(
                 "Could not patch seek_experts_help budget on captain — "
                 "budget enforcement will not be active"
+            )
+
+        # ---- OpenRouter critic client (content evaluator + VLM) ----
+        # Routes all critic LLM/VLM calls through OpenRouter so they never
+        # compete with the main pipeline for local vLLM GPU inference.
+        _or_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not _or_key:
+            # Fallback: try to read from evaluation_config.yaml
+            _eval_cfg_path = Path("evaluation_config.yaml")
+            if _eval_cfg_path.exists():
+                try:
+                    with open(_eval_cfg_path) as _f:
+                        _eval_cfg = yaml.safe_load(_f) or {}
+                    _or_key = _eval_cfg.get("openrouter_api_key", "")
+                except Exception:
+                    pass
+        if _or_key:
+            from openai import OpenAI as _OpenAI
+            self._critic_client: Optional[Any] = _OpenAI(
+                api_key=_or_key,
+                base_url=os.environ.get(
+                    "CRITIC_BASE_URL", "https://openrouter.ai/api/v1",
+                ),
+                timeout=60.0,
+                max_retries=1,
+            )
+            self._critic_model = os.environ.get(
+                "CRITIC_MODEL", "google/gemini-2.5-flash",
+            )
+            self._critic_vision_model = os.environ.get(
+                "CRITIC_VISION_MODEL", "google/gemini-2.5-flash",
+            )
+            logger.info(
+                "Critic OpenRouter client configured: model=%s, vision_model=%s",
+                self._critic_model, self._critic_vision_model,
+            )
+        else:
+            self._critic_client = None
+            self._critic_model = ""
+            self._critic_vision_model = ""
+            logger.warning(
+                "No OPENROUTER_API_KEY found — critic LLM/VLM calls will "
+                "fall back to local vLLM (may cause GPU contention)"
             )
 
         # ---- WP-C1: Modular critic registry ----
@@ -2566,6 +2676,7 @@ class CaptainPipeline:
             _total_bad_in_session[0] = 0
             _call_history.clear()
             _bad_tool_call_streak[0] = 0
+            _json_error_streak[0] = 0
 
             format_suffix = self._FORMAT_SUFFIXES.get(stage_for_budget, "")
 
@@ -2887,8 +2998,20 @@ class CaptainPipeline:
         On LLM failure or unparseable response, returns an empty list
         (non-blocking — the structural gate is the safety net).
         """
+        _MAX_CRITIC_FAILURES = 3
         rubric = self._CRITIC_RUBRICS.get(stage_name)
         if not rubric:
+            return []
+
+        # If the content evaluator has failed too many times (e.g. vLLM
+        # persistently returning empty bodies), stop calling it and let
+        # the structural gate be the sole safety net.
+        if getattr(self, "_critic_failure_count", 0) >= _MAX_CRITIC_FAILURES:
+            logger.warning(
+                "Content evaluator disabled after %d cumulative failures "
+                "— relying on structural gate only for %s",
+                self._critic_failure_count, label,
+            )
             return []
 
         prompt = STAGE_CRITIC_PROMPT.format(
@@ -2900,17 +3023,27 @@ class CaptainPipeline:
             {"role": "user", "content": artifacts_summary[:6000]},
         ]
         try:
-            from autogen.oai import OpenAIWrapper
+            if self._critic_client is not None:
+                # ── OpenRouter path (no local GPU contention) ──
+                response = self._critic_client.chat.completions.create(
+                    model=self._critic_model,
+                    messages=messages,
+                    temperature=0.0,
+                )
+                reply = response.choices[0].message.content or ""
+            else:
+                # ── Fallback: local vLLM via OpenAIWrapper ──
+                from autogen.oai import OpenAIWrapper
 
-            cfg = self._base_config_dict()
-            cfg["temperature"] = 0.0
-            for _entry in cfg.get("config_list", []):
-                _entry["timeout"] = 600  # 10 min hard cap per evaluation call
-            client = OpenAIWrapper(**cfg)
-            response = client.create(messages=messages)
-            reply = strip_think_tokens(
-                response.choices[0].message.content or ""
-            )
+                cfg = self._base_config_dict()
+                cfg["temperature"] = 0.0
+                for _entry in cfg.get("config_list", []):
+                    _entry["timeout"] = 120
+                client = OpenAIWrapper(**cfg)
+                response = client.create(messages=messages)
+                reply = strip_think_tokens(
+                    response.choices[0].message.content or ""
+                )
         except Exception as exc:
             self._critic_failure_count = getattr(self, "_critic_failure_count", 0) + 1
             logger.warning(
@@ -3195,6 +3328,9 @@ class CaptainPipeline:
 
     def _vlm_available(self) -> bool:
         """Check if a multimodal VLM is available for plot quality evaluation."""
+        # OpenRouter critic client supports vision via configured model
+        if self._critic_client is not None:
+            return True
         return (
             self.server_manager is not None
             and getattr(self.server_manager, "is_multimodal", False)
@@ -3565,8 +3701,10 @@ class CaptainPipeline:
         if not self._vlm_available():
             return []
 
-        vlm_url = self.server_manager.base_url
-        vlm_model = getattr(self.server_manager, "_current_model", None) or "Qwen/Qwen3.5-27B"
+        _use_openrouter_vlm = self._critic_client is not None
+        if not _use_openrouter_vlm:
+            vlm_url = self.server_manager.base_url
+            vlm_model = getattr(self.server_manager, "_current_model", None) or "Qwen/Qwen3.5-27B"
 
         scientific_mode = getattr(
             self.run_config, "visual_review_mode", "basic"
@@ -3596,25 +3734,36 @@ class CaptainPipeline:
                 with open(plot_path, "rb") as fh:
                     img_b64 = base64.b64encode(fh.read()).decode()
 
-                resp = _requests.post(
-                    f"{vlm_url}/chat/completions",
-                    json={
-                        "model": vlm_model,
-                        "messages": [
-                            {"role": "system", "content": review_prompt},
-                            {"role": "user", "content": [
-                                {"type": "image_url",
-                                 "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
-                                {"type": "text",
-                                 "text": f"Review this plot: {fname}"},
-                            ]},
-                        ],
-                        "max_tokens": 800 if scientific_mode else 600,
-                    },
-                    timeout=120,
-                )
-                msg = resp.json()["choices"][0]["message"]
-                reply = self._extract_vlm_reply(msg)
+                _vlm_messages = [
+                    {"role": "system", "content": review_prompt},
+                    {"role": "user", "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        {"type": "text",
+                         "text": f"Review this plot: {fname}"},
+                    ]},
+                ]
+                if _use_openrouter_vlm:
+                    # ── OpenRouter path (no local GPU contention) ──
+                    _vlm_resp = self._critic_client.chat.completions.create(
+                        model=self._critic_vision_model,
+                        messages=_vlm_messages,
+                        max_tokens=800 if scientific_mode else 600,
+                    )
+                    reply = _vlm_resp.choices[0].message.content or ""
+                else:
+                    # ── Fallback: local vLLM via HTTP POST ──
+                    resp = _requests.post(
+                        f"{vlm_url}/chat/completions",
+                        json={
+                            "model": vlm_model,
+                            "messages": _vlm_messages,
+                            "max_tokens": 800 if scientific_mode else 600,
+                        },
+                        timeout=120,
+                    )
+                    msg = resp.json()["choices"][0]["message"]
+                    reply = self._extract_vlm_reply(msg)
                 parsed = parse_json_tolerant(reply)
 
                 if scientific_mode and isinstance(parsed, dict):
@@ -4660,6 +4809,7 @@ class CaptainPipeline:
             _data_profile = profile_dataset(
                 cleaned_path,
                 context_grouping_columns=self.grouping_columns or None,
+                context_extend_columns=self.grouping_extend_when_present or None,
                 mode=_profiling_mode,
             )
             save_profile(_data_profile, analysis_dir)
@@ -4668,14 +4818,16 @@ class CaptainPipeline:
 
         # ── Grouping guidance: profile-based or legacy ──
         if _data_profile is not None:
-            # Use profile-driven grouping
-            group_summary = get_group_summary(cleaned_path, extra_columns=self.grouping_columns)
-            groups = group_summary.get("groups", {})
-            group_cols = (
-                _data_profile.recommended_grouping.columns
-                if _data_profile.recommended_grouping
-                else list(groups.keys())
-            )
+            # Use profile-driven grouping — avoid legacy get_group_summary()
+            # which relies on KNOWN_GROUP_COLUMNS keyword matching
+            if _data_profile.recommended_grouping:
+                group_cols = _data_profile.recommended_grouping.columns
+                # Build a minimal group_summary for payload compatibility
+                group_summary = {"groups": {c: {} for c in group_cols}}
+            else:
+                # Fallback: profile exists but no grouping recommendation
+                group_summary = get_group_summary(cleaned_path, extra_columns=self.grouping_columns)
+                group_cols = list(group_summary.get("groups", {}).keys())
             group_guidance = build_profile_instructions(_data_profile)
             _grouping_override = ""  # profile instructions already include mandatory grouping
         else:

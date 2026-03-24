@@ -41,7 +41,7 @@ DEFAULT_STAGE_ORDER = ["cleaning", "analysis", "cross_validation", "report"]
 
 DEFAULT_MAX_RETRIES = {
     "cleaning": 2,
-    "analysis": 1,
+    "analysis": 2,
     "cross_validation": 1,
     "report": 0,
 }
@@ -154,6 +154,7 @@ class ConstraintSpec:
     preserve_columns: List[str] = field(default_factory=lambda: list(DEFAULT_PRESERVE_COLUMNS))
     no_aggregation_across: List[str] = field(default_factory=list)
     grouping_columns: List[str] = field(default_factory=list)
+    grouping_extend_when_present: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -405,6 +406,15 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
         convergence_target=float(raw.get("convergence_target", defaults.convergence_target)),
         expert_library=str(raw.get("expert_library", defaults.expert_library)),
         agent_definitions_dir=str(raw.get("agent_definitions_dir", defaults.agent_definitions_dir)),
+        # WP-C1: Per-critic module toggles
+        critic_structural=bool(raw.get("critic_structural", defaults.critic_structural)),
+        critic_content=bool(raw.get("critic_content", defaults.critic_content)),
+        critic_visual=bool(raw.get("critic_visual", defaults.critic_visual)),
+        critic_analytical_depth=bool(raw.get("critic_analytical_depth", defaults.critic_analytical_depth)),
+        critic_execution=bool(raw.get("critic_execution", defaults.critic_execution)),
+        # WP-C2: Targeted refinement toggles
+        targeted_refinement=bool(raw.get("targeted_refinement", defaults.targeted_refinement)),
+        refinement_cascade=bool(raw.get("refinement_cascade", defaults.refinement_cascade)),
     )
     if cfg.visual_review_mode not in ("basic", "scientific"):
         logger.warning(
@@ -451,6 +461,7 @@ def _build_constraint_spec(raw: Dict[str, Any]) -> ConstraintSpec:
         preserve_columns=list(raw.get("preserve_columns", DEFAULT_PRESERVE_COLUMNS)),
         no_aggregation_across=list(raw.get("no_aggregation_across", [])),
         grouping_columns=list(raw.get("grouping_columns", [])),
+        grouping_extend_when_present=list(raw.get("grouping_extend_when_present", [])),
     )
 
 
