@@ -121,6 +121,14 @@ class AnalyticalDepthCritic(CriticModule):
         # 5. Missing outlier analysis
         checks.extend(self._check_outlier_analysis(findings, per_group))
 
+        # 6. Chart appropriateness (are chart types suited to the data?)
+        checks.extend(self._check_chart_appropriateness(
+            ctx.listing, per_group, summary,
+        ))
+
+        # 7. Cross-group interaction depth
+        checks.extend(self._check_interaction_depth(per_group, findings))
+
         # ── Optional LLM-enhanced check ──
         if ctx.llm_client or self._pipeline:
             llm_checks = self._run_llm_depth_check(summary, ctx)
@@ -225,22 +233,29 @@ class AnalyticalDepthCritic(CriticModule):
         covered_str = ", ".join(sorted(covered_purposes)) if covered_purposes else "none"
         missing_str = ", ".join(missing_details)
 
+        # Graduated severity: 3+ missing → MUST_FIX, 1-2 → SHOULD_FIX
+        # Requiring a full secondary analysis across all missing dimensions
+        # is beyond what a single retry can accomplish; only hard-block when
+        # the analysis omits the majority of the dimensional structure.
+        severity = Severity.MUST_FIX if len(missing) >= 3 else Severity.SHOULD_FIX
+
         return [CheckResult(
             name="depth__grouping_inadequate",
             passed=False,
-            severity=Severity.MUST_FIX,
+            severity=severity,
             category=CheckCategory.CONTENT_QUALITY,
             detail=(
                 f"Analysis grouped by {grouping_cols or '(unknown)'} "
                 f"(covers: {covered_str}) but dataset has important ungrouped "
-                f"dimensions: {missing_str}. The analysis may be too coarse."
+                f"dimensions: {missing_str}. "
+                f"{'A secondary analysis context is required.' if len(missing) >= 2 else 'Consider a secondary analysis.'}"
             ),
             fix_instruction=(
-                f"Revise the grouping to include the missing dimensions. "
-                f"The data has these key analytical dimensions that should be "
-                f"represented in per_group: {missing_str}. "
-                f"Consider grouping by a compound key that includes at least "
-                f"the process phase and experimental condition columns."
+                f"Keep the current primary grouping key. Add a SECONDARY "
+                f"analysis using the missing dimensions: {missing_str}. "
+                f"Include results in a 'secondary_analysis' key or as "
+                f"additional findings referencing these dimensions. "
+                f"Use analysis_contexts from the data profile for guidance."
             ),
         )]
 
@@ -269,7 +284,7 @@ class AnalyticalDepthCritic(CriticModule):
         return [CheckResult(
             name="depth__missing_group_comparison",
             passed=False,
-            severity=Severity.SHOULD_FIX,
+            severity=Severity.MUST_FIX,
             category=CheckCategory.CONTENT_QUALITY,
             detail=f"{n_groups} groups present but no ANOVA/Kruskal-Wallis comparison performed",
             fix_instruction=(
@@ -300,10 +315,15 @@ class AnalyticalDepthCritic(CriticModule):
                     break
 
         if len(detected_types) <= 1 and len(png_names) >= 3:
+            # Graduated: many homogeneous plots → MUST_FIX, few → SHOULD_FIX
+            _chart_severity = (
+                Severity.MUST_FIX if len(png_names) >= 5
+                else Severity.SHOULD_FIX
+            )
             return [CheckResult(
                 name="depth__homogeneous_charts",
                 passed=False,
-                severity=Severity.SHOULD_FIX,
+                severity=_chart_severity,
                 category=CheckCategory.CONTENT_QUALITY,
                 detail=(
                     f"All {len(png_names)} plots appear to be the same chart type. "
@@ -326,15 +346,33 @@ class AnalyticalDepthCritic(CriticModule):
     def _check_interpretation_depth(
         self, findings: List[str],
     ) -> List[CheckResult]:
-        """Flag findings with numeric deviations but no interpretive vocabulary."""
+        """Flag findings with numeric deviations but no genuine interpretation.
+
+        Uses LLM semantic evaluation when a critic client is available,
+        falling back to a lightweight heuristic otherwise.
+        """
         if not findings:
             return []
 
+        # ── Try LLM-based semantic evaluation first ──
+        if hasattr(self, '_pipeline') and self._pipeline._critic_client is not None:
+            return self._llm_interpretation_check(findings)
+
+        # ── Fallback: lightweight heuristic (less strict than keyword matching) ──
         bare_count = 0
         for f in findings:
             f_lower = str(f).lower()
             has_number = bool(re.search(r'\d+\.?\d*%', str(f)))
-            has_interpretation = any(word in f_lower for word in _INTERPRETATION_VOCABULARY)
+            # Check for ANY explanatory language, not just vocabulary tokens
+            has_interpretation = (
+                any(word in f_lower for word in _INTERPRETATION_VOCABULARY)
+                or len(f_lower.split()) > 15  # longer findings likely contain explanation
+                or any(phrase in f_lower for phrase in [
+                    " because ", " due to ", " which ", " this ",
+                    " may ", " could ", " likely ", " potential",
+                    " check ", " verify ", " investigate",
+                ])
+            )
             if has_number and not has_interpretation:
                 bare_count += 1
 
@@ -346,10 +384,15 @@ class AnalyticalDepthCritic(CriticModule):
                 detail="All findings with numeric values include interpretive context",
             )]
 
+        # Graduated: majority bare → MUST_FIX, minority → SHOULD_FIX
+        _interp_severity = (
+            Severity.MUST_FIX if bare_count / len(findings) > 0.5
+            else Severity.SHOULD_FIX
+        )
         return [CheckResult(
             name="depth__bare_deviations",
             passed=False,
-            severity=Severity.SHOULD_FIX,
+            severity=_interp_severity,
             category=CheckCategory.CONTENT_QUALITY,
             detail=(
                 f"{bare_count}/{len(findings)} findings state numeric deviations "
@@ -362,6 +405,71 @@ class AnalyticalDepthCritic(CriticModule):
                 "(3) a recommended action or investigation."
             ),
         )]
+
+    def _llm_interpretation_check(
+        self, findings: List[str],
+    ) -> List[CheckResult]:
+        """LLM-based semantic interpretation depth check."""
+        prompt = (
+            "You are evaluating findings from a biologics data analysis pipeline.\n"
+            "The agent model is a 27B parameter model (Qwen3.5-27B).\n\n"
+            "For each finding below, assess whether it includes genuine domain\n"
+            "interpretation — not just a numeric deviation, but an explanation of\n"
+            "what it means for product quality or the process.\n\n"
+            "A finding PASSES only if it contains ALL of:\n"
+            "  (1) a quantitative observation with specific values AND\n"
+            "  (2) domain-specific interpretation explaining what the observation\n"
+            "      means for product quality, process performance, or scientific\n"
+            "      understanding (not just restating the number in words)\n"
+            "A finding FAILS if:\n"
+            "  - It states a deviation without explaining significance\n"
+            "  - It restates a number in words without domain reasoning\n"
+            "  - It lacks specific group/run references\n\n"
+            "Be strict — superficial restatements of numbers do not constitute\n"
+            "interpretation. Require genuine domain reasoning.\n\n"
+            "Return JSON: {\"bare_count\": N, \"total\": N, \"detail\": \"...\"}\n"
+            "No code fences."
+        )
+        findings_text = "\n".join(f"  {i+1}. {f}" for i, f in enumerate(findings[:8]))
+        try:
+            response = self._pipeline._critic_client.chat.completions.create(
+                model=self._pipeline._critic_model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"Findings:\n{findings_text}"},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+            )
+            reply = strip_think_tokens(response.choices[0].message.content or "")
+            parsed = parse_json_tolerant(reply)
+            if not isinstance(parsed, dict):
+                return []
+
+            bare_count = int(parsed.get("bare_count", 0))
+            if bare_count == 0:
+                return [CheckResult(
+                    name="depth__interpretation_depth",
+                    passed=True,
+                    category=CheckCategory.CONTENT_QUALITY,
+                    detail=parsed.get("detail", "All findings include interpretive context"),
+                )]
+            return [CheckResult(
+                name="depth__bare_deviations",
+                passed=False,
+                severity=Severity.SHOULD_FIX,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=parsed.get("detail", f"{bare_count}/{len(findings)} findings lack interpretation"),
+                fix_instruction=(
+                    "Each finding with a numeric deviation should explain: "
+                    "(1) what the deviation means in domain context, "
+                    "(2) a possible root cause or process explanation, "
+                    "(3) a recommended action or investigation."
+                ),
+            )]
+        except Exception as exc:
+            logger.warning("LLM interpretation check failed, skipping: %s", exc)
+            return []
 
     def _check_domain_expectations(
         self, summary: Dict[str, Any], ctx: CriticContext,
@@ -470,6 +578,112 @@ class AnalyticalDepthCritic(CriticModule):
             ),
         )]
 
+    def _check_chart_appropriateness(
+        self,
+        listing: List[Dict[str, Any]],
+        per_group: Dict[str, Any],
+        summary: Dict[str, Any],
+    ) -> List[CheckResult]:
+        """Flag when more informative chart types are available but unused."""
+        png_names = [
+            Path(item["path"]).stem.lower()
+            for item in listing
+            if isinstance(item, dict) and str(item.get("path", "")).endswith(".png")
+        ]
+        if not png_names:
+            return []
+
+        detected_types: Set[str] = set()
+        for name in png_names:
+            for ct in _CHART_TYPES:
+                if ct in name:
+                    detected_types.add(ct)
+                    break
+
+        checks: List[CheckResult] = []
+        n_groups = len(per_group)
+
+        # Multi-group comparison benefits from heatmap/box/violin
+        if n_groups >= 5 and not (detected_types & {"heatmap", "box", "violin"}):
+            checks.append(CheckResult(
+                name="depth__missing_multigroup_chart",
+                passed=False,
+                severity=Severity.SHOULD_FIX,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=(
+                    f"{n_groups} groups but no heatmap, box, or violin plot "
+                    "for multi-group comparison"
+                ),
+                fix_instruction=(
+                    "Add a heatmap or box/violin plot for multi-group "
+                    "comparison of key metrics."
+                ),
+            ))
+
+        # High-dimensional data benefits from correlation/PCA
+        dp = summary.get("data_profile") or {}
+        col_roles = dp.get("column_roles", {})
+        n_numeric = len(col_roles.get("continuous_measurement", []))
+        if n_numeric > 10 and not (
+            detected_types & {"scatter", "correlation", "pca", "cluster"}
+        ):
+            checks.append(CheckResult(
+                name="depth__missing_dimensionality_chart",
+                passed=False,
+                severity=Severity.SHOULD_FIX,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=(
+                    f"{n_numeric} numeric columns but no scatter, correlation "
+                    "matrix, or PCA plot for dimensionality exploration"
+                ),
+                fix_instruction=(
+                    "Add a scatter/correlation matrix or PCA plot to explore "
+                    "relationships across numeric columns."
+                ),
+            ))
+
+        return checks
+
+    def _check_interaction_depth(
+        self,
+        per_group: Dict[str, Any],
+        findings: List[str],
+    ) -> List[CheckResult]:
+        """Flag when multi-group data lacks cross-group interaction analysis."""
+        if len(per_group) < 4:
+            return []
+
+        findings_text = " ".join(str(f) for f in findings).lower()
+        _interaction_keywords = (
+            "interaction", "cross-group", "between groups",
+            "group x", "two-way", "factorial", "moderation",
+            "depends on", "varies across", "differs by",
+        )
+        has_interaction = any(kw in findings_text for kw in _interaction_keywords)
+        if has_interaction:
+            return [CheckResult(
+                name="depth__interaction_analysis",
+                passed=True,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail="Cross-group interaction analysis present",
+            )]
+
+        return [CheckResult(
+            name="depth__no_interaction_analysis",
+            passed=False,
+            severity=Severity.SHOULD_FIX,
+            category=CheckCategory.CONTENT_QUALITY,
+            detail=(
+                f"{len(per_group)} groups but no cross-group interaction "
+                "analysis in findings"
+            ),
+            fix_instruction=(
+                "Explore whether the effect of one grouping variable varies "
+                "across levels of another (e.g. does column type performance "
+                "differ between runs?). Include interaction findings."
+            ),
+        )]
+
     def _run_llm_depth_check(
         self, summary: Dict[str, Any], ctx: CriticContext,
     ) -> List[CheckResult]:
@@ -507,6 +721,7 @@ class AnalyticalDepthCritic(CriticModule):
                         {"role": "user", "content": input_text[:4000]},
                     ],
                     temperature=0.0,
+                    max_tokens=2048,
                 )
                 reply = response.choices[0].message.content or ""
             else:
@@ -516,7 +731,7 @@ class AnalyticalDepthCritic(CriticModule):
                 cfg = self._pipeline._base_config_dict()
                 cfg["temperature"] = 0.0
                 for _entry in cfg.get("config_list", []):
-                    _entry["timeout"] = 120
+                    _entry["timeout"] = 600  # vLLM fallback: must wait out GroupChat queue
                 client = OpenAIWrapper(**cfg)
                 response = client.create(messages=[
                     {"role": "system", "content": prompt},

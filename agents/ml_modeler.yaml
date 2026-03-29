@@ -1,10 +1,15 @@
 name: ml_modeler
-description: "Clustering, PCA, predictive models."
+description: "Clustering, PCA, predictive models, TabPFN foundation model."
 system_prompt_key: ML_MODELING_PROMPT
 stages: [analysis]
 prompt_modifiers:
-  grouping_instructions: false
-  v2_suffix: false
+  grouping_instructions: true
+  v2_suffix: true
+  tabpfn_addendum: true
 activation:
+  always: true
+  domain_keywords: [peak_area, yield, recovery, purity, concentration, ratio]
+  column_roles: [continuous_measurement]
+  semantic_purposes: [experimental_condition, experimental_unit]
   min_numeric_columns: 3
   min_rows: 30

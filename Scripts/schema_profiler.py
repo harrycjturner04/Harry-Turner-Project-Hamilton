@@ -177,6 +177,9 @@ class DataProfile:
     columns: List[ColumnProfile] = field(default_factory=list)
     grouping_candidates: List[GroupingCandidate] = field(default_factory=list)
     recommended_grouping: Optional[GroupingCandidate] = None
+    # Extended grouping: a user-directed finer grouping for the subset
+    # of rows where extension columns are non-null.
+    extended_grouping: Optional[GroupingCandidate] = None
     # Role summaries for quick access
     identifiers: List[str] = field(default_factory=list)
     categorical_groups: List[str] = field(default_factory=list)
@@ -236,6 +239,18 @@ class DataProfile:
                 "columns": self.recommended_grouping.columns,
                 "group_count": self.recommended_grouping.group_count,
                 "score": round(self.recommended_grouping.score, 3),
+            }
+
+        if self.extended_grouping:
+            result["extended_grouping"] = {
+                "columns": self.extended_grouping.columns,
+                "group_count": self.extended_grouping.group_count,
+                "rows_covered_pct": self.extended_grouping.rows_covered_pct,
+                "note": (
+                    f"For the {self.extended_grouping.rows_covered_pct}% of rows "
+                    f"where {[c for c in self.extended_grouping.columns if c not in (self.recommended_grouping.columns if self.recommended_grouping else [])]} "
+                    f"are non-null, use this finer grouping for sub-analysis."
+                ),
             }
 
         # Profiler warnings (context override rejection, partial override notes)
@@ -515,6 +530,8 @@ def _score_grouping(
 def _evaluate_grouping(
     df: pd.DataFrame,
     columns: List[str],
+    *,
+    max_groups: int = _MAX_GROUPS,
 ) -> Optional[GroupingCandidate]:
     """Evaluate a specific set of columns as a compound grouping key.
 
@@ -524,6 +541,13 @@ def _evaluate_grouping(
     subset of rows where they are present.  The coverage percentage is
     factored into the quality score so that higher-null groupings are
     ranked lower (not eliminated) compared to fully-populated ones.
+
+    Args:
+        max_groups: Override the upper group-count limit.  The default
+            ``_MAX_GROUPS`` (200) is appropriate for speculative candidate
+            enumeration.  For user-directed context extensions, callers
+            can pass a higher ceiling so that analytically meaningful
+            but higher-cardinality groupings are not rejected.
     """
     # Check all columns exist
     missing = [c for c in columns if c not in df.columns]
@@ -542,7 +566,7 @@ def _evaluate_grouping(
     group_sizes = grouped.size()
     group_count = len(group_sizes)
 
-    if group_count < _MIN_GROUPS or group_count > _MAX_GROUPS:
+    if group_count < _MIN_GROUPS or group_count > max_groups:
         return None
 
     min_size = int(group_sizes.min())
@@ -1754,6 +1778,7 @@ def profile_dataset(
     # Priority: (1) full context override, (1b) partial context override,
     #           (2) semantic composition, (3) top inferred
     recommended: Optional[GroupingCandidate] = None
+    _extended_gc: Optional[GroupingCandidate] = None
     _context_override_rejected: Optional[str] = None
     _partial_override_notes: List[str] = []
     if context_grouping_columns:
@@ -1766,33 +1791,41 @@ def profile_dataset(
                 context_grouping_columns, override_gc.group_count,
             )
             # Try extending with additional columns from context.md.
-            # Add one at a time and keep only those that still pass.
+            # Extensions produce a *separate* finer grouping for the
+            # subset of rows where the extension columns are non-null.
+            # The base recommended grouping is never replaced because
+            # extension columns can have high null rates (dropping
+            # coverage) and produce many more groups.
             if _extend_columns:
-                extended = list(context_grouping_columns)
+                ext_trial = list(context_grouping_columns)
                 for ext_col in _extend_columns:
-                    trial = extended + [ext_col]
-                    trial_gc = _evaluate_grouping(df, trial)
+                    trial = ext_trial + [ext_col]
+                    trial_gc = _evaluate_grouping(
+                        df, trial,
+                        max_groups=_MAX_GROUPS * 3,
+                    )
                     if trial_gc is not None:
-                        extended = trial
-                        recommended = trial_gc
+                        ext_trial = trial
+                        _extended_gc = trial_gc
                         logger.info(
-                            "Extended override with '%s': %s (%d groups, "
+                            "Extended grouping with '%s': %s (%d groups, "
                             "coverage=%.1f%%)",
-                            ext_col, extended, trial_gc.group_count,
+                            ext_col, ext_trial, trial_gc.group_count,
                             trial_gc.rows_covered_pct,
                         )
                     else:
                         _partial_override_notes.append(
                             f"Extension column '{ext_col}' was eligible "
                             f"(null < {_CANDIDATE_NULL_CEILING*100:.0f}%) "
-                            f"but extending the grouping to {trial} failed "
-                            f"evaluation. Using {extended} instead. "
-                            f"Consider sub-group analysis on '{ext_col}' within "
-                            f"the rows where it is non-null."
+                            f"but extending the grouping to {trial} produced "
+                            f"too many groups. Consider sub-group analysis on "
+                            f"'{ext_col}' within individual "
+                            f"{', '.join(context_grouping_columns)} groups."
                         )
                         logger.info(
-                            "Extension column '%s' failed evaluation, keeping %s",
-                            ext_col, extended,
+                            "Extension column '%s' failed evaluation, "
+                            "not included in extended grouping",
+                            ext_col,
                         )
         else:
             # Diagnose why the override failed
@@ -1873,6 +1906,7 @@ def profile_dataset(
         columns=col_profiles,
         grouping_candidates=grouping_candidates[:10],  # keep top 10
         recommended_grouping=recommended,
+        extended_grouping=_extended_gc,
         identifiers=[cp.name for cp in col_profiles if cp.role == "identifier"],
         categorical_groups=[cp.name for cp in col_profiles if cp.role == "categorical_group"],
         ordinal_stages=[cp.name for cp in col_profiles if cp.role == "ordinal_stage"],
@@ -2088,6 +2122,24 @@ def build_profile_instructions(profile: DataProfile) -> str:
                 )
             lines.append("  Consider these if the default grouping is too coarse for")
             lines.append("  your analysis question or if you need finer subgroups.")
+            lines.append("")
+
+        # ── Extended grouping for subset analysis ──
+        if profile.extended_grouping:
+            eg = profile.extended_grouping
+            ext_cols = [c for c in eg.columns if c not in rg.columns]
+            ext_str = ", ".join(eg.columns)
+            lines.append("EXTENDED GROUPING (for subset analysis):")
+            lines.append(f"  When analysing the {eg.rows_covered_pct}% of rows where "
+                          f"{', '.join(ext_cols)} {'is' if len(ext_cols) == 1 else 'are'} "
+                          f"non-null, use the finer grouping: ({ext_str}).")
+            lines.append(f"  This produces {eg.group_count} groups "
+                          f"(median size: {eg.median_group_size} rows).")
+            lines.append(f"  Use this for stage-level or sample-level breakdown "
+                          f"within each ({key_str}) group.")
+            lines.append(f"  The remaining {round(100 - eg.rows_covered_pct, 1)}% of rows "
+                          f"(where {', '.join(ext_cols)} {'is' if len(ext_cols) == 1 else 'are'} "
+                          f"null) should still be analysed using the default grouping above.")
             lines.append("")
     else:
         lines.append("GROUPING GUIDANCE:")

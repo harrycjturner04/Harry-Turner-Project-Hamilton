@@ -115,8 +115,12 @@ VLLM_PORT=$(( 8000 + ${SLURM_JOB_ID:-0} % 1000 ))
 if [ -f .env ]; then
     HUGGINGFACE_API_KEY=$(grep -E '^HUGGINGFACE_API_KEY=' .env | tail -n 1 | cut -d '=' -f2- || true)
     export HUGGINGFACE_API_KEY="${HUGGINGFACE_API_KEY:-}"
+    # Critic LLM/VLM calls routed through OpenRouter (separate from evaluation judge)
+    _OR_KEY=$(grep -E '^CRITIC_OPENROUTER_API_KEY=' .env | tail -n 1 | cut -d '=' -f2- || true)
+    export CRITIC_OPENROUTER_API_KEY="${_OR_KEY:-}"
 else
     export HUGGINGFACE_API_KEY="${HUGGINGFACE_API_KEY:-}"
+    export CRITIC_OPENROUTER_API_KEY="${CRITIC_OPENROUTER_API_KEY:-}"
 fi
 
 # vLLM readiness timeout (used by ServerManager inside pipeline)

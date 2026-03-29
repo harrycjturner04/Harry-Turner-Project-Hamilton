@@ -21,3 +21,4 @@ markdown>=3.5
 reportlab>=4.0
 playwright>=1.40
 protobuf>=3.20,<7
+tabpfn>=2.0

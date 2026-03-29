@@ -97,6 +97,33 @@ class StructuralCritic(CriticModule):
                 )
 
         if len(missing_dims) >= 2:
+            # 2+ missing important dimensions → MUST_FIX to force secondary
+            # analysis context.  The primary grouping key stays as-is; agents
+            # must add a secondary analysis covering the missing dimensions.
+            results.append(CheckResult(
+                name="grouping_adequacy",
+                passed=False,
+                severity=Severity.MUST_FIX,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    f"Grouping uses {sorted(used_cols)} but the profiler "
+                    f"detected {len(missing_dims)} additional meaningful "
+                    f"dimensions not covered: {', '.join(missing_dims)}. "
+                    f"A secondary analysis context using these dimensions "
+                    f"is required."
+                ),
+                fix_instruction=(
+                    "Keep the current primary grouping key. Add a SECONDARY "
+                    "analysis using the missing dimensions (e.g. per-stage "
+                    "trends, per-condition comparisons). Include results in "
+                    "a 'secondary_analysis' key in analysis_summary.json or "
+                    "as additional findings that explicitly reference the "
+                    "missing dimensions. Use the ANALYSIS CONTEXTS from the "
+                    "data profile for guidance."
+                ),
+            ))
+        elif len(missing_dims) == 1:
+            # 1 missing dimension → advisory SHOULD_FIX
             results.append(CheckResult(
                 name="grouping_adequacy",
                 passed=False,
@@ -104,15 +131,13 @@ class StructuralCritic(CriticModule):
                 category=CheckCategory.STRUCTURAL,
                 detail=(
                     f"Grouping uses {sorted(used_cols)} but the profiler "
-                    f"detected {len(missing_dims)} additional meaningful "
-                    f"dimensions not covered: {', '.join(missing_dims)}. "
-                    f"Consider using analysis contexts that include these "
-                    f"dimensions for finer-grained analysis."
+                    f"detected 1 additional meaningful dimension not "
+                    f"covered: {missing_dims[0]}. Consider including it "
+                    f"in a secondary analysis."
                 ),
                 fix_instruction=(
-                    "Extend the grouping key or use the ANALYSIS CONTEXTS "
-                    "from the data profile to include the missing dimensions "
-                    "in at least some analyses (e.g., per-stage trends)."
+                    "Consider adding a secondary analysis using the missing "
+                    "dimension for finer-grained insights."
                 ),
             ))
         else:

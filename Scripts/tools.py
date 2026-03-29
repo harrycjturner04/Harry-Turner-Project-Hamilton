@@ -129,7 +129,7 @@ class IssueTracker:
     issue_name: str
     first_seen_attempt: int
     consecutive_count: int = 1
-    max_consecutive: int = 2
+    max_consecutive: int = 4
     resolved: bool = False
 
     @property
@@ -173,7 +173,10 @@ def _score_check_list(checks: List[CheckResult]) -> float:
     return round(total / len(checks), 4)
 
 
-def compute_quality_score(verdict: StageVerdict) -> float:
+def compute_quality_score(
+    verdict: StageVerdict,
+    evaluators_ran: Optional[Dict[str, bool]] = None,
+) -> float:
     """Compute a numeric quality score (0.0–1.0) from a StageVerdict.
 
     Scoring:
@@ -182,7 +185,11 @@ def compute_quality_score(verdict: StageVerdict) -> float:
       - must_fix check = 0.0
     Structural checks get 1x weight, content/plot checks get 2x weight.
 
-    Hard-cap rule: any must_fix on a content or plot check caps the final
+    If *evaluators_ran* is provided and key LLM/VLM evaluators were skipped,
+    a coverage penalty is applied (-0.05 per skipped evaluator) to prevent
+    inflated scores from incomplete evaluation.
+
+    Hard-cap rule: any must_fix check caps the final
     score at 0.80, ensuring the convergent strategy (target 0.85) will
     always trigger a retry for substantive quality failures.
 
@@ -199,7 +206,7 @@ def compute_quality_score(verdict: StageVerdict) -> float:
 
     total_weight = 0.0
     weighted_sum = 0.0
-    has_content_must_fix = False
+    has_any_must_fix = False
     for check in all_checks:
         # Content and plot checks get higher weight
         weight = 2.0 if check.category in (
@@ -212,28 +219,52 @@ def compute_quality_score(verdict: StageVerdict) -> float:
             score = 0.5
         else:  # MUST_FIX or unknown
             score = 0.0
-            if check.category in (
-                CheckCategory.CONTENT_QUALITY, CheckCategory.PLOT_QUALITY,
-            ):
-                has_content_must_fix = True
+            has_any_must_fix = True
 
         weighted_sum += weight * score
         total_weight += weight
 
     raw_score = round(weighted_sum / total_weight, 4) if total_weight > 0 else 1.0
 
-    # Hard cap: a must_fix on content/plot is a substantive failure that
-    # should not be silently accepted by convergent early-stop.
-    if has_content_must_fix:
+    # Hard cap: ANY must_fix (structural, content, or plot) is a substantive
+    # failure that should not be silently accepted by convergent early-stop.
+    if has_any_must_fix:
         raw_score = min(raw_score, 0.80)
+
+    # Soft cap: many SHOULD_FIX on content/plot prevents convergent
+    # early-stop at the target (0.85).
+    sf_content_count = sum(
+        1 for c in all_checks
+        if not c.passed and c.severity == Severity.SHOULD_FIX
+        and c.category in (CheckCategory.CONTENT_QUALITY, CheckCategory.PLOT_QUALITY)
+    )
+    if sf_content_count > 3:
+        raw_score = min(raw_score, 0.85)
+
+    # Coverage penalty: if LLM/VLM evaluators were expected but did not run,
+    # the score is inflated by their absence.  Apply -0.05 per skipped
+    # evaluator to prevent convergent early-stop from accepting incomplete
+    # evaluation.
+    if evaluators_ran:
+        _EXPECTED_EVALUATORS = {"content", "analytical_depth", "plot_quality"}
+        skipped = [
+            e for e in _EXPECTED_EVALUATORS
+            if evaluators_ran.get(e) is False
+        ]
+        if skipped:
+            coverage_penalty = 0.05 * len(skipped)
+            raw_score = max(0.0, raw_score - coverage_penalty)
 
     return raw_score
 
 
-def compute_quality_breakdown(verdict: StageVerdict) -> QualityScoreBreakdown:
+def compute_quality_breakdown(
+    verdict: StageVerdict,
+    evaluators_ran: Optional[Dict[str, bool]] = None,
+) -> QualityScoreBreakdown:
     """Compute per-dimension quality scores for enhanced trajectory tracking."""
     return QualityScoreBreakdown(
-        overall=compute_quality_score(verdict),
+        overall=compute_quality_score(verdict, evaluators_ran=evaluators_ran),
         structural=_score_check_list(verdict.structural_checks),
         content=_score_check_list(verdict.content_checks),
         visual=_score_check_list(verdict.plot_checks),
@@ -283,23 +314,48 @@ def _ensure_list(value: Any) -> List[Any]:
 
 
 def extract_json_payload(text: str) -> str:
-    """Extract the first JSON object from *text* (fenced or bare)."""
+    """Extract the first JSON object or array from *text* (fenced or bare)."""
     if text is None:
         raise ValueError("Empty response")
     if isinstance(text, dict):
         return json.dumps(text)
 
-    # Try fenced blocks first
+    # Fast path: if the stripped text is already valid JSON (object or array),
+    # return it directly.  This correctly handles JSON arrays like [{...}, ...].
+    stripped = text.strip()
+    if stripped and stripped[0] in ("[", "{"):
+        try:
+            json.loads(stripped)
+            return stripped
+        except json.JSONDecodeError:
+            pass
+
+    # Try fenced blocks (handle both objects and arrays)
     if "```" in text:
         fences = text.split("```")
         for i in range(1, len(fences), 2):
             block = fences[i].strip()
             if block.startswith("json"):
                 block = block[4:].strip()
-            if block.startswith("{") and block.endswith("}"):
+            if (block.startswith("{") and block.endswith("}")) or \
+               (block.startswith("[") and block.endswith("]")):
                 return block
 
-    # Brace-matching fallback
+    # Bracket-matching for JSON arrays
+    depth = 0
+    start = None
+    for idx, ch in enumerate(text):
+        if ch == "[":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "]":
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return text[start : idx + 1]
+
+    # Brace-matching fallback for JSON objects
     depth = 0
     start = None
     for idx, ch in enumerate(text):
@@ -682,8 +738,12 @@ def cap_artifact_size(path: Path) -> bool:
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough estimate: ~4 characters per token for English / JSON."""
-    return len(text) // 4
+    """Rough estimate: ~3.2 characters per token for structured JSON.
+
+    The previous 4-char heuristic overestimated token count by ~20-30%%
+    for JSON payloads, triggering premature truncation.
+    """
+    return int(len(text) / 3.2)
 
 
 def trim_payload_to_budget(
@@ -695,26 +755,100 @@ def trim_payload_to_budget(
     prompt (~2K), agent library (~3K), conversation history (~50K), and
     format suffixes (~2K) within the model's 131K+ effective context window.
 
+    Trimming order (least → most analytically valuable):
+      0. metadata_context
+      1. evidence bulk (preview_rows, numeric_describe)
+      2. context_text (shorten)
+      3. cleaning_summary subfields
+      4. data_profile.phase_b (recoverable from parquet)
+      5. group_summary values (top 10)
+      6. analysis_contexts (multi-angle guidance — preserve as long as possible)
+      7. instructions (hard-truncate to 12K chars — last resort)
+
     Returns a (potentially trimmed) copy of *payload*.
     """
     text = json.dumps(payload, default=str)
-    if estimate_tokens(text) <= max_input_tokens:
+    initial_est = estimate_tokens(text)
+    if initial_est <= max_input_tokens:
         return payload
 
     trimmed = dict(payload)  # shallow copy
+    _levels_hit: list[str] = []
 
-    # Level 0 — strip Phase B from data_profile (distributions +
-    #   technique recommendations) — least critical, trimmed first
+    def _fits() -> bool:
+        return estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens
+
+    # Level 0 — remove verbose metadata records (least analytical value)
+    for field in ("metadata_context", "metadata_context_text"):
+        if field in trimmed:
+            trimmed[field] = "[trimmed]"
+    if _fits():
+        _levels_hit.append("L0:metadata")
+        logger.info("Payload trimming stopped at level 0 (metadata). Levels: %s", _levels_hit)
+        return trimmed
+    _levels_hit.append("L0:metadata")
+
+    # Level 1 — strip evidence bulk (preview_rows, numeric_describe)
+    if "evidence" in trimmed and isinstance(trimmed["evidence"], dict):
+        ev = dict(trimmed["evidence"])
+        ev.pop("preview_rows", None)
+        ev.pop("numeric_describe", None)
+        trimmed["evidence"] = ev
+        if _fits():
+            _levels_hit.append("L1:evidence_bulk")
+            logger.info("Payload trimming stopped at level 1. Levels: %s", _levels_hit)
+            return trimmed
+    _levels_hit.append("L1:evidence_bulk")
+
+    # Level 2 — shorten context text
+    if isinstance(trimmed.get("context_text"), str):
+        trimmed["context_text"] = trimmed["context_text"][:2000] + "...[trimmed]"
+        if _fits():
+            _levels_hit.append("L2:context_text")
+            logger.info("Payload trimming stopped at level 2. Levels: %s", _levels_hit)
+            return trimmed
+    _levels_hit.append("L2:context_text")
+
+    # Level 3 — strip bulky cleaning_summary subfields (low analytical value)
+    if "cleaning_summary" in trimmed and isinstance(trimmed["cleaning_summary"], dict):
+        cs = dict(trimmed["cleaning_summary"])
+        for bulky_key in ("sample_values", "numeric_summary", "categorical_columns"):
+            cs.pop(bulky_key, None)
+        trimmed["cleaning_summary"] = cs
+        if _fits():
+            _levels_hit.append("L3:cleaning_summary")
+            logger.info("Payload trimming stopped at level 3. Levels: %s", _levels_hit)
+            return trimmed
+    _levels_hit.append("L3:cleaning_summary")
+
+    # Level 4 — strip Phase B from data_profile (distributions +
+    #   technique recommendations — valuable but recoverable from parquet)
     dp = trimmed.get("data_profile")
     if isinstance(dp, dict) and "phase_b" in dp:
         dp = dict(dp)
-        dp.pop("phase_b", None)
+        dp["phase_b"] = "[trimmed — recompute normality from cleaned parquet if needed]"
         trimmed["data_profile"] = dp
-        if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
+        if _fits():
+            _levels_hit.append("L4:phase_b")
+            logger.info("Payload trimming stopped at level 4. Levels: %s", _levels_hit)
             return trimmed
+    _levels_hit.append("L4:phase_b")
 
-    # Level 0.5 — strip analysis_contexts from dimensional_structure
-    #   (keep dimensions and hierarchy for core structural understanding)
+    # Level 5 — truncate group_summary values (top 10 instead of 30)
+    if "group_summary" in trimmed and isinstance(trimmed["group_summary"], dict):
+        gs = dict(trimmed["group_summary"])
+        for gk, gv in gs.get("groups", {}).items():
+            if isinstance(gv, dict) and "values" in gv:
+                gv["values"] = dict(list(gv["values"].items())[:10])
+        trimmed["group_summary"] = gs
+        if _fits():
+            _levels_hit.append("L5:group_summary")
+            logger.info("Payload trimming stopped at level 5. Levels: %s", _levels_hit)
+            return trimmed
+    _levels_hit.append("L5:group_summary")
+
+    # Level 6 — strip analysis_contexts from dimensional_structure
+    #   (multi-angle analysis guidance — analytically important, trim late)
     dp = trimmed.get("data_profile")
     if isinstance(dp, dict) and isinstance(dp.get("dimensional_structure"), dict):
         dp = dict(dp)
@@ -722,53 +856,23 @@ def trim_payload_to_budget(
         ds.pop("analysis_contexts", None)
         dp["dimensional_structure"] = ds
         trimmed["data_profile"] = dp
-        if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
+        if _fits():
+            _levels_hit.append("L6:analysis_contexts")
+            logger.info("Payload trimming stopped at level 6. Levels: %s", _levels_hit)
             return trimmed
+    _levels_hit.append("L6:analysis_contexts")
 
-    # Level 1 — remove verbose metadata records
-    for field in ("metadata_context", "metadata_context_text"):
-        if field in trimmed:
-            trimmed[field] = "[trimmed]"
-            if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
-                return trimmed
-
-    # Level 2 — strip evidence bulk
-    if "evidence" in trimmed and isinstance(trimmed["evidence"], dict):
-        ev = dict(trimmed["evidence"])
-        ev.pop("preview_rows", None)
-        ev.pop("numeric_describe", None)
-        trimmed["evidence"] = ev
-        if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
-            return trimmed
-
-    # Level 3 — shorten context text
-    if isinstance(trimmed.get("context_text"), str):
-        trimmed["context_text"] = trimmed["context_text"][:2000] + "...[trimmed]"
-        if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
-            return trimmed
-
-    # Level 4 — truncate group_summary values (top 10 instead of 30)
-    if "group_summary" in trimmed and isinstance(trimmed["group_summary"], dict):
-        gs = dict(trimmed["group_summary"])
-        for gk, gv in gs.get("groups", {}).items():
-            if isinstance(gv, dict) and "values" in gv:
-                gv["values"] = dict(list(gv["values"].items())[:10])
-        trimmed["group_summary"] = gs
-        if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
-            return trimmed
-
-    # Level 5 — strip bulky cleaning_summary subfields
-    if "cleaning_summary" in trimmed and isinstance(trimmed["cleaning_summary"], dict):
-        cs = dict(trimmed["cleaning_summary"])
-        for bulky_key in ("sample_values", "numeric_summary", "categorical_columns"):
-            cs.pop(bulky_key, None)
-        trimmed["cleaning_summary"] = cs
-        if estimate_tokens(json.dumps(trimmed, default=str)) <= max_input_tokens:
-            return trimmed
-
-    # Level 6 — hard-truncate instructions
+    # Level 7 — hard-truncate instructions (last resort — 12K chars)
     if "instructions" in trimmed and isinstance(trimmed["instructions"], str):
-        trimmed["instructions"] = trimmed["instructions"][:6000] + "...[trimmed]"
+        trimmed["instructions"] = trimmed["instructions"][:12000] + "...[trimmed]"
+    _levels_hit.append("L7:instructions")
+
+    final_est = estimate_tokens(json.dumps(trimmed, default=str))
+    logger.warning(
+        "Payload trimming exhausted all levels. initial=%d tokens, final=%d tokens, "
+        "budget=%d. Levels hit: %s",
+        initial_est, final_est, max_input_tokens, _levels_hit,
+    )
 
     return trimmed
 
@@ -1092,10 +1196,11 @@ def quality_gate(
     verdict: StageVerdict,
     max_retries: int,
     previous_verdict: Optional[StageVerdict] = None,
+    sf_accumulation_threshold: int = 4,
 ) -> GateResult:
     """Deterministic gate decision based on aggregated check results.
 
-    - No must_fix failures → passed
+    - No must_fix failures → passed (unless SHOULD_FIX accumulation threshold hit)
     - Only should_fix → passed with warnings
     - must_fix but attempt >= max_retries → passed_degraded
     - Stall detection: same must_fix as previous attempt → passed_degraded
@@ -1106,9 +1211,10 @@ def quality_gate(
     """
     must_fix = verdict.must_fix_failures()
     should_fix = verdict.should_fix_failures()
-    _quality_score = compute_quality_score(verdict)
+    _evaluators_ran = getattr(verdict, "evaluators_ran", None)
+    _quality_score = compute_quality_score(verdict, evaluators_ran=_evaluators_ran)
 
-    _quality_breakdown = compute_quality_breakdown(verdict)
+    _quality_breakdown = compute_quality_breakdown(verdict, evaluators_ran=_evaluators_ran)
 
     # Helper: attach quality_score and breakdown before returning any GateResult
     def _make_result(**kwargs: Any) -> GateResult:
@@ -1157,8 +1263,23 @@ def quality_gate(
             warnings=coverage_warnings,
         )
 
-    # Only advisory issues — pass with warnings
+    # Only advisory issues — but check accumulation threshold first.
+    # Too many SHOULD_FIX issues collectively indicate inadequate quality.
     if not must_fix:
+        sf_count = len(should_fix)
+        if sf_count >= sf_accumulation_threshold and verdict.attempt < max_retries:
+            verdict.overall_passed = False
+            verdict.gate_decision = "retry_accumulated_sf"
+            return _make_result(
+                status="failed", verdict=verdict,
+                retry_tier="full",
+                retry_instructions=_build_retry_text(should_fix),
+                warnings=[
+                    f"{sf_count} SHOULD_FIX issues accumulated "
+                    f"(threshold: {sf_accumulation_threshold})"
+                ],
+            )
+        # Below threshold or budget exhausted — pass with warnings
         verdict.overall_passed = True
         verdict.gate_decision = "pass_with_warnings"
         return _make_result(
@@ -1191,6 +1312,31 @@ def quality_gate(
                     "Stall detected: identical must_fix failures as previous attempt"
                 ] + [c.detail for c in must_fix],
             )
+
+    # Substantive-findings exemption: if the stage produced real findings
+    # (min_findings passed) and the only MUST_FIX failures are from
+    # analytical_depth or interpretation checks, accept as degraded rather
+    # than risking a retry that might destroy the existing findings.
+    _DEPTH_ONLY_PREFIXES = ("depth__",)
+    _INTERP_NAMES = {"interpretation_depth", "insight_quality"}
+    _depth_only_must_fix = all(
+        c.name.startswith(_DEPTH_ONLY_PREFIXES) or c.name in _INTERP_NAMES
+        for c in must_fix
+    )
+    _has_findings = any(
+        c.name == "min_findings" and c.passed
+        for c in verdict.structural_checks
+    )
+    if _depth_only_must_fix and _has_findings and must_fix:
+        verdict.overall_passed = True
+        verdict.gate_decision = "pass_with_warnings"
+        return _make_result(
+            status="passed_degraded", verdict=verdict,
+            warnings=[
+                f"Substantive findings present; {len(must_fix)} depth/interpretation "
+                "issues accepted as advisory to protect existing analysis"
+            ] + [c.detail for c in must_fix],
+        )
 
     # Route to appropriate retry tier and build refinement directives
     plot_only = verdict.plot_only_failures()

@@ -424,10 +424,16 @@ def _query_knowledge(
 def _create_groupchat_agents(
     llm_config: Dict[str, Any],
     work_dir: Path,
+    figure_dir: Optional[Path] = None,
 ) -> tuple:
     """Create the Visualisation and Interpretation agents for the GroupChat.
 
     Returns (vis_agent, interp_agent, user_proxy, groupchat, manager).
+
+    If *figure_dir* is provided, a figure-manifest message is injected into
+    the GroupChat after the VisualisationAgent's code has been executed so
+    that the InterpretationAgent knows exactly which figures exist on disk
+    and can reference them by filename.
     """
     from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
 
@@ -464,14 +470,64 @@ def _create_groupchat_agents(
     # Deterministic turn limit prevents vis→terminal loop from starving
     # the InterpretationAgent (see pipeline stabilisation plan).
     _MAX_VIS_TURNS = 5
+    _figure_manifest_injected = False
+
+    # Directories to scan for generated figures
+    _scan_dirs = [d for d in [figure_dir, work_dir] if d is not None]
 
     def _speaker_selection(last_speaker, groupchat):
         """Route messages through the defined workflow."""
+        nonlocal _figure_manifest_injected
+
         vis_turns = sum(
             1 for m in groupchat.messages if m.get("name") == vis_agent.name
         )
 
         if last_speaker == user_proxy:
+            # ── Figure manifest injection ──
+            # After code execution by VisualisationAgent, scan for generated
+            # figures and inject a manifest so InterpretationAgent knows
+            # which files are available and can reference them by filename.
+            if not _figure_manifest_injected:
+                vis_spoke = any(
+                    m.get("name") == vis_agent.name for m in groupchat.messages
+                )
+                if vis_spoke:
+                    generated: List[str] = []
+                    for scan_dir in _scan_dirs:
+                        if scan_dir and scan_dir.exists():
+                            generated.extend(
+                                p.name for p in sorted(scan_dir.rglob("*.png"))
+                                if p.stat().st_size >= 5000
+                            )
+                    # Deduplicate preserving order
+                    seen_names: set = set()
+                    unique_names: List[str] = []
+                    for n in generated:
+                        if n not in seen_names:
+                            seen_names.add(n)
+                            unique_names.append(n)
+                    if unique_names:
+                        manifest_lines = [
+                            "## Generated Figures\n",
+                            "The following figures have been created. Use these "
+                            "EXACT filenames when referencing figures in the report. "
+                            "The figure number matches the numeric prefix in the "
+                            "filename (e.g. fig1_* = Figure 1, 01_* = Figure 1).\n",
+                        ]
+                        for fn in unique_names:
+                            manifest_lines.append(f"- `{fn}`")
+                        groupchat.messages.append({
+                            "role": "assistant",
+                            "name": "FigureManifest",
+                            "content": "\n".join(manifest_lines),
+                        })
+                        _figure_manifest_injected = True
+                        logger.debug(
+                            "Per-file figure manifest injected: %d figures",
+                            len(unique_names),
+                        )
+
             # After code execution: if vis has had enough turns, hand off
             if vis_turns >= _MAX_VIS_TURNS:
                 logger.info(
@@ -559,6 +615,54 @@ def _extract_report_markdown(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _build_figure_number_map(
+    all_figures: List[str],
+) -> Dict[int, str]:
+    """Build a figure-number → path mapping using filename prefixes first,
+    falling back to ordinal position only for unmatched figures.
+
+    Recognises these naming conventions (case-insensitive):
+      fig1_description.png   →  Figure 1
+      fig_1_description.png  →  Figure 1
+      figure1_description.png→  Figure 1
+      01_description.png     →  Figure 1
+      001_description.png    →  Figure 1
+
+    Any figures whose filenames do NOT contain a recognisable numeric prefix
+    are assigned to the next available figure number by ordinal position.
+    """
+    fig_map: Dict[int, str] = {}
+    unmatched: List[str] = []
+
+    _prefix_re = re.compile(
+        r'^(?:fig(?:ure)?[_\-]?)?(\d{1,3})[_\-]',
+        re.IGNORECASE,
+    )
+
+    for fig_path in all_figures:
+        stem = Path(fig_path).stem
+        m = _prefix_re.match(stem)
+        if m:
+            num = int(m.group(1))
+            if num not in fig_map:
+                fig_map[num] = fig_path
+            else:
+                # Number already claimed — treat as unmatched
+                unmatched.append(fig_path)
+        else:
+            unmatched.append(fig_path)
+
+    # Assign unmatched figures to the next free ordinal slots
+    next_num = 1
+    for fig_path in unmatched:
+        while next_num in fig_map:
+            next_num += 1
+        fig_map[next_num] = fig_path
+        next_num += 1
+
+    return fig_map
+
+
 def _embed_inline_figures(
     report_md: str,
     all_figures: List[str],
@@ -566,22 +670,32 @@ def _embed_inline_figures(
     """Match inline 'Figure N' references to actual figure files and embed them.
 
     Returns (updated_report_md, set_of_embedded_figure_paths).
+
+    Matching strategy (in priority order):
+      1. Explicit filename reference on the same line (e.g. ``fig1_uv.png``)
+      2. Filename numeric-prefix match  (fig1_* / 01_* → Figure 1)
+      3. Ordinal-position fallback (Nth figure in list)
+
     Figures are inserted as ![...](path) immediately after the paragraph that
-    references them. Unmatched figures are NOT embedded here (caller handles them).
+    references them.  Unmatched figures are NOT embedded here (caller handles).
     """
     if not all_figures:
         return report_md, set()
 
-    # Build a mapping: figure number → figure path (by ordinal position)
-    fig_map: Dict[int, str] = {}
-    for i, fig_path in enumerate(all_figures, 1):
-        fig_map[i] = fig_path
+    # ── Build smart mapping: figure number → path ──
+    fig_map = _build_figure_number_map(all_figures)
 
-    # Find all "Figure N" references and the paragraphs containing them
+    # Also build a quick lookup by filename (lowercased) for explicit refs
+    path_by_name: Dict[str, str] = {
+        Path(fp).name.lower(): fp for fp in all_figures
+    }
+
+    # ── Walk lines and embed after paragraphs ──
     embedded: set = set()
     lines = report_md.split("\n")
     result_lines: List[str] = []
     fig_pattern = re.compile(r'(?:Figure|Fig\.?)\s+(\d+)', re.IGNORECASE)
+    filename_pattern = re.compile(r'[`"\']?([\w\-]+\.png)[`"\']?', re.IGNORECASE)
 
     i = 0
     while i < len(lines):
@@ -591,7 +705,6 @@ def _embed_inline_figures(
         # Check if this line references a figure
         matches = fig_pattern.findall(line)
         if matches:
-            # Check if we're at the end of a paragraph (next line is blank or end)
             is_para_end = (
                 i + 1 >= len(lines)
                 or lines[i + 1].strip() == ""
@@ -600,8 +713,20 @@ def _embed_inline_figures(
             if is_para_end:
                 for fig_num_str in matches:
                     fig_num = int(fig_num_str)
-                    if fig_num in fig_map and fig_map[fig_num] not in embedded:
+
+                    # Strategy 1: explicit filename on the same line
+                    fig_path = None
+                    fname_match = filename_pattern.search(line)
+                    if fname_match:
+                        candidate = fname_match.group(1).lower()
+                        if candidate in path_by_name:
+                            fig_path = path_by_name[candidate]
+
+                    # Strategy 2: filename-prefix mapping
+                    if fig_path is None and fig_num in fig_map:
                         fig_path = fig_map[fig_num]
+
+                    if fig_path and fig_path not in embedded:
                         fig_name = Path(fig_path).stem.replace("_", " ").title()
                         encoded_path = quote(fig_path, safe="/:")
                         result_lines.append("")
@@ -643,6 +768,90 @@ def _select_figures(
     return all_figures
 
 
+def _classify_figure_theme(stem: str) -> str:
+    """Classify a figure into a thematic group based on its filename stem."""
+    sl = stem.lower()
+    _THEME_KEYWORDS = {
+        "Chromatography & Elution": [
+            "elution", "chromatogram", "overlay", "gradient", "uv_280",
+            "uv280", "mau", "peak", "column", "profile",
+        ],
+        "Statistical Comparisons": [
+            "boxplot", "violin", "box", "comparison", "kruskal", "anova",
+            "significance", "bar", "grouped",
+        ],
+        "Correlation & Heatmaps": [
+            "heatmap", "correlation", "heat", "spearman", "pearson", "matrix",
+        ],
+        "Outlier & Anomaly Detection": [
+            "outlier", "anomal", "deviation", "detection",
+        ],
+        "Mass Spectrometry": [
+            "mass", "mz", "dalton", "kda", "charge", "deconvol", "spectrum",
+            "tic", "response",
+        ],
+        "Trends & Distributions": [
+            "trend", "kde", "density", "distribution", "line", "scatter",
+            "hexbin",
+        ],
+        "Summary & Dashboard": [
+            "dashboard", "summary", "overview",
+        ],
+    }
+    for theme, keywords in _THEME_KEYWORDS.items():
+        if any(kw in sl for kw in keywords):
+            return theme
+    return "Other"
+
+
+def _build_themed_figure_section(figures: List[str]) -> str:
+    """Build an 'Additional Figures' markdown section grouped by theme."""
+    from collections import OrderedDict
+
+    themed: Dict[str, List[str]] = OrderedDict()
+    for fig_path in figures:
+        stem = Path(fig_path).stem
+        theme = _classify_figure_theme(stem)
+        themed.setdefault(theme, []).append(fig_path)
+
+    section = "\n\n## Additional Figures\n"
+    fig_counter = 1
+    for theme, paths in themed.items():
+        section += f"\n### {theme}\n\n"
+        for fig_path in paths:
+            fig_name = Path(fig_path).stem.replace("_", " ").title()
+            abs_fig_path = Path(fig_path).resolve()
+            encoded_path = quote(str(abs_fig_path), safe="/:")
+            section += f"**Figure {fig_counter}**: {fig_name}\n\n"
+            section += f"![{fig_name}]({encoded_path})\n\n"
+            fig_counter += 1
+
+    return section
+
+
+def _log_figure_alignment(report_md: str) -> None:
+    """Log a summary of all figure references in the assembled report.
+
+    For each ![Figure N: desc](path) found, logs the figure number,
+    alt text, file path, and whether the file exists on disk.
+    """
+    ref_pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+    refs_found = ref_pattern.findall(report_md)
+    if not refs_found:
+        return
+    for alt_text, path_str in refs_found:
+        # Decode URL-encoded path for existence check
+        from urllib.parse import unquote
+        decoded = unquote(path_str)
+        exists = Path(decoded).exists() if not decoded.startswith(("http", "data:")) else True
+        status = "OK" if exists else "MISSING"
+        logger.info(
+            "Figure alignment: [%s] alt='%s' path='%s'",
+            status, alt_text[:60], Path(decoded).name if not decoded.startswith("http") else decoded[:60],
+        )
+    logger.info("Figure alignment: %d total references in assembled report", len(refs_found))
+
+
 def _assemble_report_with_figures(
     report_md: str,
     figure_dir: Path,
@@ -654,7 +863,12 @@ def _assemble_report_with_figures(
     """Embed figure references into the report markdown.
 
     First attempts to embed figures inline next to their "Figure N" references.
-    Any remaining figures are appended in a Figures section at the end.
+    Any remaining figures are appended in a Figures section at the end, grouped
+    by analytical theme.
+
+    Figure ordering: report-stage figures (from figure_dir) come FIRST so that
+    their numeric prefixes (fig1_*, 01_*) align with the InterpretationAgent's
+    "Figure N" numbering, followed by original analysis-stage figures.
 
     figure_selection controls strategy:
       - "all": include all figures (baseline behaviour)
@@ -669,13 +883,16 @@ def _assemble_report_with_figures(
         "original_plots=%d",
         figure_dir, figure_dir.exists(), _fig_count, len(original_plots),
     )
-    # Collect all figures (original + newly generated)
-    all_figures = list(original_plots)
+    # Collect all figures — report-stage figures FIRST so that their
+    # numeric filename prefixes (fig1_*, 01_*) align with the
+    # InterpretationAgent's "Figure N" numbering.
+    all_figures: List[str] = []
     if figure_dir.exists():
         for ext in ("*.png", "*.svg", "*.jpg"):
-            all_figures.extend(str(p) for p in figure_dir.glob(ext))
+            all_figures.extend(str(p) for p in sorted(figure_dir.glob(ext)))
+    all_figures.extend(original_plots)
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order (report figures take precedence)
     seen: set = set()
     deduped: List[str] = []
     for f in all_figures:
@@ -684,8 +901,13 @@ def _assemble_report_with_figures(
             deduped.append(f)
     all_figures = deduped
 
+    # Build a combined lookup by stem across ALL figures (report + analysis)
+    all_by_stem: Dict[str, str] = {}
+    for fp in all_figures:
+        all_by_stem.setdefault(Path(fp).stem.lower(), fp)
+
     # If report already has image markdown references, absolutize paths,
-    # validate existence, and attempt to fix broken refs against figure_dir.
+    # validate existence, and attempt to fix broken refs against all figures.
     if "![" in report_md:
         # Build a lookup of actual figures in figure_dir by stem
         actual_by_stem: Dict[str, str] = {}
@@ -695,6 +917,11 @@ def _assemble_report_with_figures(
                     actual_by_stem[p.stem.lower()] = str(p)
 
         referenced_paths: set = set()
+
+        # Filename-prefix regex for matching figN_ / figure_N_ / 01_ patterns
+        _prefix_re = re.compile(
+            r'^(?:fig(?:ure)?[_\-]?)?(\d{1,3})[_\-]', re.IGNORECASE,
+        )
 
         def _fix_ref(m):
             alt_text = m.group(1)
@@ -709,8 +936,12 @@ def _assemble_report_with_figures(
             if p.exists():
                 referenced_paths.add(str(p))
                 return f"![{alt_text}]({quote(str(p), safe='/:=')})"
-            # Path doesn't exist — try to match stem against actual figure_dir
+            # Path doesn't exist — try to match stem against all known figures
             stem = p.stem.lower()
+            if stem in all_by_stem:
+                replacement = all_by_stem[stem]
+                referenced_paths.add(replacement)
+                return f"![{alt_text}]({quote(replacement, safe='/:=')})"
             if stem in actual_by_stem:
                 replacement = actual_by_stem[stem]
                 referenced_paths.add(replacement)
@@ -719,9 +950,10 @@ def _assemble_report_with_figures(
             fig_match = re.search(r'(\d+)', alt_text)
             if fig_match:
                 fig_num = int(fig_match.group(1))
-                # Match against figure_dir files with that number prefix
-                for fstem, fpath in actual_by_stem.items():
-                    if fstem.startswith(f"{fig_num:02d}_") or fstem.startswith(f"fig{fig_num}_"):
+                # Search ALL known figures for a matching numeric prefix
+                for fstem, fpath in all_by_stem.items():
+                    pm = _prefix_re.match(fstem)
+                    if pm and int(pm.group(1)) == fig_num:
                         referenced_paths.add(fpath)
                         return f"![{alt_text}]({quote(fpath, safe='/:=')})"
             # No match found — leave the broken ref (will be logged)
@@ -744,15 +976,9 @@ def _assemble_report_with_figures(
             unreferenced, figure_selection, max_figures, png_min_bytes
         )
         if unreferenced:
-            figure_section = "\n\n## Additional Figures\n\n"
-            for i, fig_path in enumerate(unreferenced, 1):
-                fig_name = Path(fig_path).stem.replace("_", " ").title()
-                abs_fig_path = Path(fig_path).resolve()
-                encoded_path = quote(str(abs_fig_path), safe="/:")
-                figure_section += f"**Figure**: {fig_name}\n\n"
-                figure_section += f"![{fig_name}]({encoded_path})\n\n"
-            report_md += figure_section
+            report_md += _build_themed_figure_section(unreferenced)
 
+        _log_figure_alignment(report_md)
         return report_md
 
     # Apply figure selection strategy (WP6)
@@ -767,17 +993,9 @@ def _assemble_report_with_figures(
     # Phase 2: Append any remaining (unreferenced) figures at the end
     remaining = [f for f in all_figures if f not in embedded]
     if remaining:
-        figure_section = "\n\n## Additional Figures\n\n"
-        start_idx = len(embedded) + 1
-        for i, fig_path in enumerate(remaining, start_idx):
-            fig_name = Path(fig_path).stem.replace("_", " ").title()
-            figure_section += f"**Figure {i}**: {fig_name}\n\n"
-            # Resolve to absolute path so WeasyPrint can embed the image
-            # regardless of the working directory when the PDF is rendered.
-            abs_fig_path = Path(fig_path).resolve()
-            encoded_path = quote(str(abs_fig_path), safe="/:")
-            figure_section += f"![{fig_name}]({encoded_path})\n\n"
-        report_md += figure_section
+        report_md += _build_themed_figure_section(remaining)
+
+    _log_figure_alignment(report_md)
 
     return report_md
 
@@ -836,6 +1054,7 @@ class ReportPipeline:
         max_groupchat_rounds: int = DEFAULT_MAX_GROUPCHAT_ROUNDS,
         figure_selection: str = "all",
         max_report_figures: int = 10,
+        run_config: Optional[Any] = None,
     ):
         self.llm_config = llm_config
         self.output_dir = output_dir
@@ -843,6 +1062,16 @@ class ReportPipeline:
         self.max_groupchat_rounds = max_groupchat_rounds
         self.figure_selection = figure_selection
         self.max_report_figures = max_report_figures
+        self._run_config = run_config
+
+        # BS-4: Payload budget defaults (overridden by run_config when provided)
+        self._budget_global = 40000
+        self._budget_per_file = 24000
+        self._budget_report_excerpt = 10000
+        if run_config is not None:
+            self._budget_global = getattr(run_config, "payload_budget_global", self._budget_global)
+            self._budget_per_file = getattr(run_config, "payload_budget_per_file", self._budget_per_file)
+            self._budget_report_excerpt = getattr(run_config, "payload_budget_report_excerpt", self._budget_report_excerpt)
 
         # Agents are created lazily
         self._research_agent = None
@@ -979,7 +1208,7 @@ class ReportPipeline:
         exec_dir = reports_dir.parent / "exec_workdir"
         work_dir = exec_dir / f"report_{file_name}"
         work_dir.mkdir(parents=True, exist_ok=True)
-        figure_dir = reports_dir / REPORT_FIGURES_SUBDIR
+        figure_dir = reports_dir / REPORT_FIGURES_SUBDIR / file_name
         figure_dir.mkdir(parents=True, exist_ok=True)
 
         groupchat_payload = self._build_groupchat_payload(
@@ -989,7 +1218,7 @@ class ReportPipeline:
             figure_dir=figure_dir,
         )
 
-        report_md = self._run_groupchat(groupchat_payload, work_dir)
+        report_md = self._run_groupchat(groupchat_payload, work_dir, figure_dir=figure_dir)
 
         # ── Phase 3b: Copy figures from exec_workdir to report figure dir ──
         # The VisualisationAgent's code executes with CWD=work_dir and may
@@ -1121,26 +1350,57 @@ class ReportPipeline:
             "domain_hints": item.get("domain_hints", {}),
         }
 
+        # Build a human-readable listing of existing analysis figures so
+        # both VisualisationAgent and InterpretationAgent are aware of them.
+        existing_figures_listing = ""
+        if plots:
+            fig_lines = [
+                "## Existing Analysis Figures",
+                "",
+                "The following figures were generated during the analysis stage. "
+                "VisualisationAgent should enhance these rather than recreating "
+                "equivalent plots. InterpretationAgent should reference and "
+                "discuss these alongside any new figures.",
+                "",
+            ]
+            for p in plots:
+                name = Path(p).name
+                stem = Path(p).stem.replace("_", " ").replace("-", " ").title()
+                fig_lines.append(f"- `{name}` — {stem}")
+            existing_figures_listing = "\n".join(fig_lines) + "\n\n"
+
         return (
             f"Generate a publication-quality scientific report for the analysis of **{file_name}**.\n\n"
             f"## Available Data\n\n"
-            f"```json\n{json.dumps(payload, indent=2, default=str)[:24000]}\n```\n\n"
+            f"```json\n{json.dumps(payload, indent=2, default=str)[:self._budget_per_file]}\n```\n\n"
+            f"{existing_figures_listing}"
             f"## Workflow\n\n"
-            f"1. **VisualisationAgent**: Create enhanced figures from the cleaned data at "
-            f"`{cleaned_path}`. Save figures to `{figure_dir}`. Use a professional "
-            f"scientific style (seaborn 'whitegrid', publication fonts).\n\n"
+            f"1. **VisualisationAgent**: Review existing analysis figures listed above. "
+            f"Create enhanced or supplementary figures from the cleaned data at "
+            f"`{cleaned_path}`. Save NEW figures to `{figure_dir}` using the naming "
+            f"convention `fig{{N}}_{{description}}.png` (e.g. fig1_uv_by_column.png). "
+            f"Do NOT recreate plots that already exist in the analysis figures — instead, "
+            f"focus on creating new visualisations that add analytical value (e.g. "
+            f"cross-group comparisons, statistical overlays, summary dashboards). "
+            f"Use a professional scientific style (seaborn 'whitegrid', publication fonts).\n\n"
             f"2. **InterpretationAgent**: Write the full report using the analysis findings, "
-            f"research context, knowledge base context, and new figures. The report must "
-            f"contain: Title, Executive Summary, Introduction, Materials & Methods, Results, "
-            f"Discussion, Conclusions & Recommendations, and References.\n\n"
+            f"research context, knowledge base context, existing analysis figures, AND new "
+            f"figures from VisualisationAgent. Reference figures by their exact filename. "
+            f"The report must contain: Title, Executive Summary, Introduction, Materials & "
+            f"Methods, Results, Discussion, Conclusions & Recommendations, and References.\n\n"
             f"When the report is complete, include 'REPORT_COMPLETE' at the end."
         )
 
-    def _run_groupchat(self, payload_message: str, work_dir: Path) -> str:
+    def _run_groupchat(
+        self,
+        payload_message: str,
+        work_dir: Path,
+        figure_dir: Optional[Path] = None,
+    ) -> str:
         """Execute the GroupChat and extract the report markdown."""
         try:
             vis_agent, interp_agent, user_proxy, groupchat, manager = (
-                _create_groupchat_agents(self.llm_config, work_dir)
+                _create_groupchat_agents(self.llm_config, work_dir, figure_dir=figure_dir)
             )
 
             user_proxy.initiate_chat(
@@ -1193,13 +1453,14 @@ class ReportPipeline:
             cleaned_path = item.get("cleaned_path", "")
 
             # Read individual report content (truncated for context window)
+            _excerpt_budget = self._budget_report_excerpt
             individual_report_content = ""
             report_path = result.get("report_path")
             if report_path and Path(report_path).exists():
                 try:
                     full_content = Path(report_path).read_text("utf-8")
-                    individual_report_content = full_content[:8000]
-                    if len(full_content) > 8000:
+                    individual_report_content = full_content[:_excerpt_budget]
+                    if len(full_content) > _excerpt_budget:
                         individual_report_content += "\n\n[... truncated ...]"
                 except Exception:
                     pass
@@ -1379,7 +1640,7 @@ class ReportPipeline:
             f"Generate a **cross-file comparison report** synthesising the analyses of "
             f"{len(items)} datasets.\n\n"
             f"## Available Data\n\n"
-            f"```json\n{json.dumps(payload, indent=2, default=str)[:30000]}\n```\n\n"
+            f"```json\n{json.dumps(payload, indent=2, default=str)[:self._budget_global]}\n```\n\n"
             f"## Dataset Column Reference (BS-5)\n\n"
             f"Use the `dataset_columns` field above to determine exact column names "
             f"when loading parquet files. Do NOT assume column names — read them from "

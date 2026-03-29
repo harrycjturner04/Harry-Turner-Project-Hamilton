@@ -132,17 +132,18 @@ Remaining items from baseline diagnosis (runs 866392 / 866394):
 
 - **BS-1**: Global report figure references may point to per-file analysis figures instead of
   global figures — partially mitigated by WP-3 claim-figure traceability when enabled
-- **BS-2**: `_assemble_report_with_figures` short-circuits when report already contains `![`
-  references, preserving incorrect figure paths instead of correcting them
-- **BS-4**: Payload truncation at 12K chars (per-file) and 15K chars (global) loses critical
-  analysis findings — tiered payload management planned but not yet implemented
 - **BS-5**: Global VisualisationAgent code fails to properly read/merge parquet files due to
-  differing column names between datasets — produces "Unknown" rows and empty subplots
+  differing column names between datasets — partially mitigated by dataset_columns metadata
+  injection, but still relies on LLM following instructions
 - Pipeline is fully sequential — no file-level parallelism, so multi-GPU provides no throughput gain
 
 Previously diagnosed items now addressed:
+- ~~BS-2: Figure path short-circuit~~ — `_embed_report_figures` now resolves broken `![`
+  refs via stem matching, figure-number matching, and appends unreferenced figures
 - ~~BS-3: GroupChat round exhaustion~~ — mitigated by convergence control (WP-2) and
   quality-driven stopping
+- ~~BS-4: Payload truncation~~ — replaced hardcoded char slices with configurable
+  `payload_budget_*` fields in run_config, tuned for 128K context window
 - ~~Critic feedback loop non-functional~~ — replaced by deterministic gated review loop
   with content evaluator hardening (WP-2A) ensuring reliable rubric coverage
 
@@ -187,21 +188,32 @@ pipeline:
 
     - name: analysis
       goals:
-        - Baseline correction (ALS or rolling-minimum) before peak detection
-        - Signal smoothing (Savitzky-Golay) before peak detection
-        - Per-run chromatographic or spectral overlays
-        - Per-run x stage peak or mass statistics
-        - Chromatographic resolution (Rs) between adjacent peaks
-        - System suitability parameters (plate count N, asymmetry As)
-        - Mass accuracy (ppm) for identified species (MS data only)
-        - Signal-to-noise ratio per run (MS data only)
-        - Cross-run comparison plots
-        - Outlier detection by key metric deviation (>2 SD from group mean)
-        - Heatmap of metrics across run x stage
+        # Data-structure-aware goals — the planner should adapt methods
+        # based on the schema profiler's dimensional structure and
+        # analysis contexts rather than applying fixed techniques.
+        - Per-group chromatographic or spectral profile characterisation (adapt signal processing to data structure)
+        - Cross-dimensional comparison using the detected hierarchy (e.g. experimental_unit × process_phase)
+        - Peak or mass statistics per analytical group (use recommended grouping from data profile)
+        - System suitability / quality assessment appropriate to the detected domain
+        - Cross-run consistency analysis comparing experimental units
+        - Process-phase trend analysis where stage-level grouping is available
+        - Outlier detection within each analytical group (>2 SD from group mean)
+        - Multi-dimensional heatmap or summary using the full grouping hierarchy
+        - Extended grouping analysis where finer breakdown is available (e.g. per-sample or per-stage subset)
+      grouping_guidance: |
+        Use the schema profiler's dimensional structure to determine grouping.
+        If analysis_contexts are present, use them to select appropriate grouping
+        for each analytical question. Do not default to a single flat grouping
+        when richer structure is available.
       quality:
         min_plots: 3
         min_findings: 3
         require_per_group: true
+      agent_hints:
+        require: [analysis_planner]
+        prefer: [statistical_analyst, ml_modeler]
+        max_agents: 5
+        fallback_to_detection: true
       expert_call_budget: 4
 
     - name: cross_validation
@@ -219,19 +231,18 @@ pipeline:
 
   constraints:
     preserve_columns: [run_no, run, chromatography_stage, Sample_Code, column, Fraction_number, charge_state, Spectrum_type]
-    no_aggregation_across: [run_no]
-    grouping_columns: [run_no, column]
+    no_aggregation_across: [run, run_no]
+    grouping_columns: [run, column]
     grouping_extend_when_present: [chromatography_stage, Sample_Code]
 
   run_config:
     run_label: "WP-1 FULL + CONVERGENT + Scientific"
-    prompt_version: "v2"
+    prompt_version: "v3"
     content_validation: true
     min_cross_val_claims: 5
     recompute_cross_val: true
     figure_selection: "ranked"
     max_report_figures: 10
-    rerun_issue_map_enabled: true
     protected_col_audit: true
     knowledge_base: "chromadb_local"
     research_agent: "deep_research"
@@ -242,17 +253,67 @@ pipeline:
     convergence_target: 0.85
     visual_review_mode: "scientific"
     require_figure_references: true
-    expert_library: "baseline"
+    expert_library: "extended"
     agent_definitions_dir: "agents/"
-    payload_char_limit_per_file: 12000
-    payload_char_limit_global: 15000
+    # BS-4: Payload budgets (chars) — tuned for 128K context window.
+    # Controls how much of each data source is embedded in report prompts.
+    payload_budget_cleaning: 4000           # cleaning summary JSON
+    payload_budget_analysis: 8000           # analysis summary JSON (findings, per_group, etc.)
+    payload_budget_per_file: 3000           # per-file analysis in global captain reports
+    payload_budget_global: 40000            # global report payload JSON (report_pipeline)
+    payload_budget_report_excerpt: 10000    # individual report excerpt in cross-file reports
     # WP-C: Critic architecture toggles
     critic_structural: true             # structural gate (pure Python)
     critic_content: true                # LLM content evaluator
     critic_visual: true                 # VLM plot reviewer
     critic_analytical_depth: true       # WP-C3a: Python heuristic + LLM depth analysis
-    critic_execution: false             # WP-C3b: execution correctness (enable after validation)
+    critic_execution: true              # WP-C3b: execution correctness (pure Python)
     # WP-C2: Targeted refinement
     targeted_refinement: true           # enable PLOT_FIX / FINDING_FIX / GAP_FILL paths
     refinement_cascade: false           # escalation cascade (enable after validation)
+    ml_backend: "tabpfn"                # "sklearn" | "tabpfn" | "both"
+```
+
+### ML Modelling Tasks
+
+Define supervised learning tasks for the ml_modeler agent.  These give the agent
+concrete prediction targets rather than relying on unsupervised exploration.
+The agent will attempt tasks in order and report which were feasible.
+
+```yaml
+ml_tasks:
+  chromatography:
+    - task: "classification"
+      target: "chromatography_stage"
+      description: "Predict chromatography stage from UV/conductivity features"
+      aggregate_by: ["run_no", "chromatography_stage", "column"]
+      features: ["UV_1_280_ml", "Conductivity", "volume_ml"]
+      note: "Aggregate raw rows to per-group summaries before modelling"
+    - task: "regression"
+      target: "peak_area_mean"
+      description: "Predict mean peak area from process parameters per run"
+      aggregate_by: ["run_no", "column"]
+      features: "auto"  # use all numeric summary features
+    - task: "classification"
+      target: "outlier_flag"
+      description: "Classify runs as outlier/normal based on CV > 15% threshold"
+      aggregate_by: ["run_no", "column"]
+      derive_target: "cv_threshold(UV_1_280_ml, 0.15)"
+
+  mass_spectrometry:
+    - task: "regression"
+      target: "dominant_mass_kda_mean"
+      description: "Predict dominant mass from charge state and response features"
+      aggregate_by: ["run_no", "Sample_Code", "column"]
+      features: "auto"
+    - task: "classification"
+      target: "column"
+      description: "Classify column type from mass spectrometry measurement profiles"
+      aggregate_by: ["run_no", "column"]
+      features: "auto"
+    - task: "classification"
+      target: "quality_flag"
+      description: "Flag low-quality runs based on signal-to-noise or mass accuracy"
+      aggregate_by: ["run_no", "column"]
+      derive_target: "cv_threshold(Response, 0.20)"
 ```

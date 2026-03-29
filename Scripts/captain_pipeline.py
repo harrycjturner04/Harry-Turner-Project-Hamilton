@@ -91,6 +91,8 @@ from prompts import (
     CROSS_VALIDATION_RUBRIC,
     V2_INTERPRETATION_BLOCK,
     V2_PVALUE_BLOCK,
+    V3_INTERPRETATION_BLOCK,
+    TABPFN_ADDENDUM,
     build_grouping_instructions,
 )
 from tools import (
@@ -424,6 +426,37 @@ try:
 
     @_ft.wraps(_original_oai_create)
     def _patched_oai_create(self, *args, **kwargs):
+        # ── Timeout escape hatch ─────────────────────────────────────
+        # If _abort_chat was set by the watchdog thread (chat timeout)
+        # or by the malformed-loop / empty-body circuit breakers,
+        # return a synthetic TERMINATE response immediately instead of
+        # making another multi-minute LLM call that AG2 will swallow
+        # the signal for.
+        if _abort_chat.is_set():
+            logger.warning(
+                "_abort_chat is set — returning synthetic TERMINATE "
+                "instead of making another LLM call"
+            )
+            from openai.types.chat import (
+                ChatCompletion,
+                ChatCompletionMessage,
+            )
+            from openai.types.chat.chat_completion import Choice
+            return ChatCompletion(
+                id="abort-chat-timeout",
+                created=int(time.time()),
+                model="fallback",
+                object="chat.completion",
+                choices=[Choice(
+                    index=0,
+                    finish_reason="stop",
+                    message=ChatCompletionMessage(
+                        role="assistant",
+                        content="TERMINATE",
+                    ),
+                )],
+            )
+
         # Qwen3.5 chat template requires at least one user message.
         # AG2 GroupChat can produce message lists with only system+assistant
         # messages (e.g. during reflection or speaker selection), which causes
@@ -759,10 +792,17 @@ class _ChatTimeout:
         if self._cancelled.wait(backup_wait):
             return  # chat completed normally
 
-        # Phase 1 fired: primary SIGALRM was swallowed.  Send another.
+        # Phase 1 fired: primary SIGALRM was swallowed.  Set the
+        # _abort_chat event so the monkey-patched _patched_oai_create
+        # will return TERMINATE on the next LLM call instead of
+        # starting another multi-minute generation.  This is the
+        # reliable escape hatch — AG2 can swallow signals, but it
+        # cannot bypass the check at the top of _patched_oai_create.
+        _abort_chat.set()
         logger.error(
             "Chat timeout watchdog: primary SIGALRM appears swallowed. "
-            "Sending backup SIGALRM via os.kill after %ds.", backup_wait,
+            "Set _abort_chat and sending backup SIGALRM via os.kill "
+            "after %ds.", backup_wait,
         )
         try:
             os.kill(os.getpid(), signal.SIGALRM)
@@ -1682,7 +1722,12 @@ class CaptainPipeline:
         # payload already contains richer grouping guidance — suppress the
         # legacy system-message injection to avoid dual/conflicting instructions.
         if self.run_config.schema_profiling != "disabled":
-            self._grouping_instructions: str = ""
+            self._grouping_instructions: str = (
+                "See the DATA PROFILE section in the task payload for grouping guidance.\n"
+                "Use the recommended_grouping as your default and analysis_contexts\n"
+                "for multi-dimensional questions. Extend the default grouping when\n"
+                "your analysis question requires finer discrimination."
+            )
         else:
             self._grouping_instructions: str = build_grouping_instructions(
                 self.grouping_columns, self.no_aggregation_across,
@@ -1701,9 +1746,12 @@ class CaptainPipeline:
         # ---- Agent library ----
         # Format expert prompts with context-driven grouping instructions
         _gi = self._grouping_instructions
-        # v2 prompt enhancements (WP4/WP8): append interpretation + p-value blocks
+        # Prompt version enhancements: append interpretation + p-value blocks
         _v2_suffix = ""
-        if self.run_config.prompt_version == "v2":
+        if self.run_config.prompt_version == "v3":
+            _v2_suffix = V3_INTERPRETATION_BLOCK
+            logger.info("Using v3 prompts (graduated guidance + flexible interpretation)")
+        elif self.run_config.prompt_version == "v2":
             _v2_suffix = V2_INTERPRETATION_BLOCK + V2_PVALUE_BLOCK
             logger.info("Using v2 enhanced prompts (interpretation + p-value requirements)")
 
@@ -1780,17 +1828,10 @@ class CaptainPipeline:
         # ---- OpenRouter critic client (content evaluator + VLM) ----
         # Routes all critic LLM/VLM calls through OpenRouter so they never
         # compete with the main pipeline for local vLLM GPU inference.
-        _or_key = os.environ.get("OPENROUTER_API_KEY", "")
-        if not _or_key:
-            # Fallback: try to read from evaluation_config.yaml
-            _eval_cfg_path = Path("evaluation_config.yaml")
-            if _eval_cfg_path.exists():
-                try:
-                    with open(_eval_cfg_path) as _f:
-                        _eval_cfg = yaml.safe_load(_f) or {}
-                    _or_key = _eval_cfg.get("openrouter_api_key", "")
-                except Exception:
-                    pass
+        # NOTE: This is intentionally separate from the evaluation judge config.
+        # The critic operates *inside* the pipeline loop; the evaluation judge
+        # scores final outputs *after* the pipeline finishes.
+        _or_key = os.environ.get("CRITIC_OPENROUTER_API_KEY", "")
         if _or_key:
             from openai import OpenAI as _OpenAI
             self._critic_client: Optional[Any] = _OpenAI(
@@ -1802,10 +1843,10 @@ class CaptainPipeline:
                 max_retries=1,
             )
             self._critic_model = os.environ.get(
-                "CRITIC_MODEL", "google/gemini-2.5-flash",
+                "CRITIC_MODEL", "openai/gpt-5.4-nano",
             )
             self._critic_vision_model = os.environ.get(
-                "CRITIC_VISION_MODEL", "google/gemini-2.5-flash",
+                "CRITIC_VISION_MODEL", "openai/gpt-5.4-nano",
             )
             logger.info(
                 "Critic OpenRouter client configured: model=%s, vision_model=%s",
@@ -1816,7 +1857,7 @@ class CaptainPipeline:
             self._critic_model = ""
             self._critic_vision_model = ""
             logger.warning(
-                "No OPENROUTER_API_KEY found — critic LLM/VLM calls will "
+                "No CRITIC_OPENROUTER_API_KEY found — critic LLM/VLM calls will "
                 "fall back to local vLLM (may cause GPU contention)"
             )
 
@@ -2082,8 +2123,8 @@ class CaptainPipeline:
             try:
                 with open(yaml_path, "r", encoding="utf-8") as fh:
                     defn = yaml.safe_load(fh)
-                if not isinstance(defn, dict) or "name" not in defn:
-                    logger.warning("Skipping invalid agent YAML: %s", yaml_path.name)
+                if not isinstance(defn, dict) or not defn.get("name"):
+                    logger.warning("Skipping invalid agent YAML (missing or empty name): %s", yaml_path.name)
                     continue
 
                 # Skip extended agents when in baseline mode
@@ -2119,6 +2160,8 @@ class CaptainPipeline:
                     prompt = prompt.replace("{grouping_instructions}", grouping_instructions)
                 if modifiers.get("v2_suffix"):
                     prompt = prompt + v2_suffix
+                if modifiers.get("tabpfn_addendum") and self.run_config.ml_backend in ("tabpfn", "both"):
+                    prompt = prompt + "\n\n" + TABPFN_ADDENDUM
 
                 agent_specs.append({
                     "name": name,
@@ -2157,7 +2200,10 @@ class CaptainPipeline:
              "system_message": STATISTICAL_ANALYST_PROMPT.replace("{grouping_instructions}", _gi) + v2_suffix,
              "description": "Descriptive stats, correlations, outliers, group comparisons."},
             {"name": "ml_modeler",
-             "system_message": ML_MODELING_PROMPT,
+             "system_message": ML_MODELING_PROMPT + (
+                 "\n\n" + TABPFN_ADDENDUM
+                 if self.run_config.ml_backend in ("tabpfn", "both") else ""
+             ),
              "description": "Clustering, PCA, predictive models."},
             {"name": "analysis_planner",
              "system_message": ANALYSIS_PLANNER_PROMPT,
@@ -2426,7 +2472,16 @@ class CaptainPipeline:
         nested_config["autobuild_build_config"]["default_llm_config"] = (
             self._make_llm_config_dict(temperature=0.0)
         )
-        nested_config["autobuild_build_config"]["max_agents"] = 4
+        # Use the largest stage max_agents from the run plan (default 6)
+        # so AutoBuild can accommodate the full context-driven selection.
+        _max_ab = 6
+        if self.run_plan and self.run_plan.stages:
+            _max_ab = max(
+                (s.agent_hints.max_agents for s in self.run_plan.stages),
+                default=6,
+            )
+            _max_ab = max(_max_ab, 3)  # floor: AutoBuild needs ≥2 experts
+        nested_config["autobuild_build_config"]["max_agents"] = _max_ab
         nested_config["autobuild_build_config"]["use_oai_assistant"] = False
         nested_config["autobuild_build_config"]["code_execution_config"] = self.code_execution_config
         nested_config["autobuild_build_config"]["coding"] = True
@@ -2610,7 +2665,7 @@ class CaptainPipeline:
             self.debug_root / f"{label}__attempt{attempt}__request.json",
             {"label": label, "attempt": attempt,
              "instruction_length": len(instruction),
-             "instruction": instruction[:10000]},
+             "instruction": instruction[:30000]},
         )
         # Save truncated reply for quick inspection
         safe_write_json(
@@ -2643,8 +2698,9 @@ class CaptainPipeline:
         if parse_fn is None:
             parse_fn = lambda text: text  # noqa: E731
 
-        # Token budget management (14K default leaves headroom for 32K context)
-        trimmed_payload = trim_payload_to_budget(payload)
+        # Token budget management — use RunConfig.max_input_tokens if set
+        _token_budget = getattr(self.run_config, "max_input_tokens", 65_000)
+        trimmed_payload = trim_payload_to_budget(payload, max_input_tokens=_token_budget)
         instruction = json.dumps(trimmed_payload, default=str)
 
         token_est = estimate_tokens(instruction)
@@ -2826,13 +2882,49 @@ class CaptainPipeline:
                         "Disk recovery (analysis): read %s (%d bytes, %d artifacts)",
                         asp, Path(asp).stat().st_size, len(artifacts),
                     )
+                    findings = summary.get("findings", [])
+                    per_rps = summary.get(
+                        "per_run_per_stage", summary.get("per_group", {})
+                    )
+
+                    # If current summary has empty findings, check backups
+                    # from previous attempts that may have had valid findings
+                    if not findings:
+                        asp_path = Path(asp)
+                        for backup in sorted(
+                            asp_path.parent.glob(
+                                f"{asp_path.stem}__attempt*{asp_path.suffix}"
+                            ),
+                            reverse=True,
+                        ):
+                            try:
+                                bk = json.loads(backup.read_text("utf-8"))
+                                bk_findings = bk.get("findings", [])
+                                if bk_findings:
+                                    logger.warning(
+                                        "Current %s has 0 findings; restoring "
+                                        "%d from backup %s",
+                                        asp_path.name, len(bk_findings),
+                                        backup.name,
+                                    )
+                                    findings = bk_findings
+                                    per_rps = bk.get(
+                                        "per_run_per_stage",
+                                        bk.get("per_group", per_rps),
+                                    )
+                                    # Restore the canonical file so downstream
+                                    # code reads the substantive version
+                                    import shutil
+                                    shutil.copy2(backup, asp_path)
+                                    break
+                            except Exception:
+                                continue
+
                     return {
                         "artifacts": artifacts,
-                        "findings": summary.get("findings", []),
+                        "findings": findings,
                         "plots": [a for a in artifacts if a.endswith(".png")],
-                        "per_run_per_stage": summary.get(
-                            "per_run_per_stage", summary.get("per_group", {})
-                        ),
+                        "per_run_per_stage": per_rps,
                         "notes": summary.get("notes", ""),
                         "analysis_summary_path": asp,
                         "_recovered_from_disk": True,
@@ -3024,21 +3116,20 @@ class CaptainPipeline:
         ]
         try:
             if self._critic_client is not None:
-                # ── OpenRouter path (no local GPU contention) ──
                 response = self._critic_client.chat.completions.create(
                     model=self._critic_model,
                     messages=messages,
                     temperature=0.0,
+                    max_tokens=2048,
                 )
                 reply = response.choices[0].message.content or ""
             else:
-                # ── Fallback: local vLLM via OpenAIWrapper ──
                 from autogen.oai import OpenAIWrapper
 
                 cfg = self._base_config_dict()
                 cfg["temperature"] = 0.0
                 for _entry in cfg.get("config_list", []):
-                    _entry["timeout"] = 120
+                    _entry["timeout"] = 600  # vLLM fallback: must wait out GroupChat queue
                 client = OpenAIWrapper(**cfg)
                 response = client.create(messages=messages)
                 reply = strip_think_tokens(
@@ -3131,11 +3222,12 @@ class CaptainPipeline:
                 if name not in returned_names:
                     checks.append(CheckResult(
                         name=name,
-                        passed=True,  # not evaluated = not a failure
-                        severity=None,
+                        passed=False,  # unevaluated = coverage gap, flag it
+                        severity=Severity.SHOULD_FIX,
                         category=CheckCategory.CONTENT_QUALITY,
-                        detail="Not evaluated by content evaluator",
-                        fix_instruction="",
+                        detail="Not evaluated by content evaluator (coverage gap)",
+                        fix_instruction="Content evaluator did not assess this criterion. "
+                                        "Ensure output quality meets this rubric requirement.",
                     ))
 
         logger.info(
@@ -3328,7 +3420,6 @@ class CaptainPipeline:
 
     def _vlm_available(self) -> bool:
         """Check if a multimodal VLM is available for plot quality evaluation."""
-        # OpenRouter critic client supports vision via configured model
         if self._critic_client is not None:
             return True
         return (
@@ -3434,10 +3525,16 @@ class CaptainPipeline:
             # ══════════════════════════════════════════════════════════
             # 5. QUALITY GATE (deterministic Python — unchanged)
             # ══════════════════════════════════════════════════════════
-            gate = quality_gate(verdict, max_retries, previous_verdict)
+            gate = quality_gate(
+                verdict, max_retries, previous_verdict,
+                sf_accumulation_threshold=getattr(
+                    self.run_config, "should_fix_accumulation_threshold", 4,
+                ),
+            )
             previous_verdict = verdict
 
-            # WP-2: Track quality trajectory
+            # WP-2: Track quality trajectory (enriched with issue names for
+            # oscillation detection and cumulative retry context)
             _quality_trajectory.append({
                 "attempt": attempts,
                 "quality_score": gate.quality_score,
@@ -3449,6 +3546,8 @@ class CaptainPipeline:
                 "status": gate.status,
                 "must_fix_count": len(verdict.must_fix_failures()),
                 "should_fix_count": len(verdict.should_fix_failures()),
+                "must_fix_names": [c.name for c in verdict.must_fix_failures()],
+                "should_fix_names": [c.name for c in verdict.should_fix_failures()],
                 "critics_ran": dict(_critic_ctx.evaluators_ran),
                 "refinement_scope_used": None,
             })
@@ -3456,6 +3555,25 @@ class CaptainPipeline:
             if self.debug_root:
                 safe_write_json(self.debug_root / f"{lbl}__verdict.json", verdict_to_dict(verdict))
                 safe_write_json(self.debug_root / f"{lbl}__gate.json", gate_to_dict(gate))
+
+            # ── Oscillation detection ──
+            # If issues from 2 attempts ago reappear after being fixed,
+            # we're cycling and should accept degraded.
+            if len(_quality_trajectory) >= 3:
+                _t2_issues = set(_quality_trajectory[-3].get("must_fix_names", []))
+                _t1_issues = set(_quality_trajectory[-2].get("must_fix_names", []))
+                _t0_issues = set(_quality_trajectory[-1].get("must_fix_names", []))
+                _reappeared = _t2_issues & _t0_issues - _t1_issues
+                if _reappeared and attempts >= 2:
+                    logger.warning(
+                        "Oscillation detected: issues %s reappeared after fix — "
+                        "accepting degraded", _reappeared,
+                    )
+                    gate.status = "passed_degraded"
+                    gate.warnings.append(
+                        f"Oscillation detected: {sorted(_reappeared)} — "
+                        "issues cycle between attempts"
+                    )
 
             if gate.status in ("passed", "passed_degraded"):
                 result = self._build_gated_result(gate, last_reply, listing, attempts)
@@ -3467,8 +3585,17 @@ class CaptainPipeline:
             # ══════════════════════════════════════════════════════════
             if _strategy == "convergent" and gate.status == "failed":
                 _score = gate.quality_score or 0.0
-                # Early stop: target quality already met
-                if _score >= _conv_target:
+                _has_must_fix = bool(verdict.must_fix_failures())
+                # Early stop: target quality already met — but NEVER override
+                # when MUST_FIX failures exist (they require retry regardless
+                # of numeric score).
+                if _has_must_fix and _score >= _conv_target:
+                    logger.info(
+                        "Convergent: quality score %.3f >= target %.3f but "
+                        "%d MUST_FIX failure(s) remain — NOT accepting",
+                        _score, _conv_target, len(verdict.must_fix_failures()),
+                    )
+                elif not _has_must_fix and _score >= _conv_target:
                     logger.info(
                         "Convergent: quality score %.3f >= target %.3f — accepting",
                         _score, _conv_target,
@@ -3513,6 +3640,9 @@ class CaptainPipeline:
                     _issue_trackers[mf.name] = IssueTracker(
                         issue_name=mf.name,
                         first_seen_attempt=attempts,
+                        max_consecutive=getattr(
+                            self.run_config, "issue_stall_max_consecutive", 4,
+                        ),
                     )
             # Mark resolved issues
             current_must_fix_names = {mf.name for mf in verdict.must_fix_failures()}
@@ -3595,6 +3725,27 @@ class CaptainPipeline:
                     result["quality_trajectory"] = _quality_trajectory
                     return result
 
+            # ── Backup summary before retry ──
+            # If the current attempt produced a valid summary, back it up
+            # so that if the retry fails/times out the findings aren't lost.
+            _summary_key = (
+                "analysis_summary_path" if stage_name == "analysis"
+                else "summary_path" if stage_name == "cleaning"
+                else None
+            )
+            if _summary_key:
+                _sp = base_payload.get(_summary_key, "")
+                if _sp and Path(_sp).exists() and Path(_sp).stat().st_size > 50:
+                    _backup = Path(_sp).with_name(
+                        f"{Path(_sp).stem}__attempt{attempts}{Path(_sp).suffix}"
+                    )
+                    import shutil
+                    shutil.copy2(_sp, _backup)
+                    logger.info(
+                        "Backed up %s (%d bytes) before retry → %s",
+                        Path(_sp).name, Path(_sp).stat().st_size, _backup.name,
+                    )
+
             # Full CaptainAgent retry
             attempts += 1
             base_payload = dict(base_payload)
@@ -3606,6 +3757,58 @@ class CaptainPipeline:
                     f"\n\nGROUPING REMINDER (CRITICAL): You MUST group by "
                     f"the compound key ({_gc}). Do NOT simplify to a subset.\n"
                 )
+
+            # Structured retry context: tell the agent what the previous
+            # attempt produced so it can make targeted improvements.
+            _prev_ctx_parts: List[str] = []
+            _prev_checks_passed = [
+                c.name for c in (verdict.structural_checks + verdict.content_checks)
+                if c.passed
+            ]
+            _prev_checks_failed = [
+                f"{c.name}: {c.fix_instruction}"
+                for c in verdict.must_fix_failures()
+            ]
+            if _prev_checks_passed:
+                _prev_ctx_parts.append(
+                    "PASSED CHECKS (preserve these): " + ", ".join(_prev_checks_passed[:8])
+                )
+            if _prev_checks_failed:
+                _prev_ctx_parts.append(
+                    "FAILED CHECKS (fix these):\n" + "\n".join(
+                        f"  - {f}" for f in _prev_checks_failed[:6]
+                    )
+                )
+            if listing:
+                _artifact_names = [
+                    Path(f["path"]).name for f in listing
+                    if isinstance(f, dict) and Path(f.get("path", "")).name.endswith((".png", ".json"))
+                ][:10]
+                if _artifact_names:
+                    _prev_ctx_parts.append(
+                        f"ARTIFACTS FROM PREVIOUS ATTEMPT: {_artifact_names}"
+                    )
+            if _prev_ctx_parts:
+                _retry_text += (
+                    "\n\nPREVIOUS ATTEMPT CONTEXT (attempt "
+                    f"{attempts - 1}):\n" + "\n".join(_prev_ctx_parts)
+                )
+
+            # Cumulative retry context: flag issues that have persisted
+            # across multiple attempts so the agent tries a different approach
+            _persistent = [
+                name for name, tracker in _issue_trackers.items()
+                if tracker.consecutive_count >= 2 and not tracker.resolved
+            ]
+            if _persistent:
+                _retry_text += (
+                    "\n\nPERSISTENT ISSUES (failed >=2 consecutive attempts): "
+                    + ", ".join(_persistent)
+                    + "\nThese issues have NOT been resolved by previous attempts. "
+                    "Try a FUNDAMENTALLY DIFFERENT approach to fix them — "
+                    "do not repeat the same strategy."
+                )
+
             base_payload["retry_instructions"] = _retry_text
 
     def _build_gated_result(
@@ -3744,15 +3947,13 @@ class CaptainPipeline:
                     ]},
                 ]
                 if _use_openrouter_vlm:
-                    # ── OpenRouter path (no local GPU contention) ──
                     _vlm_resp = self._critic_client.chat.completions.create(
                         model=self._critic_vision_model,
                         messages=_vlm_messages,
-                        max_tokens=800 if scientific_mode else 600,
+                        max_tokens=1024 if scientific_mode else 800,
                     )
                     reply = _vlm_resp.choices[0].message.content or ""
                 else:
-                    # ── Fallback: local vLLM via HTTP POST ──
                     resp = _requests.post(
                         f"{vlm_url}/chat/completions",
                         json={
@@ -3760,7 +3961,7 @@ class CaptainPipeline:
                             "messages": _vlm_messages,
                             "max_tokens": 800 if scientific_mode else 600,
                         },
-                        timeout=120,
+                        timeout=600,  # vLLM fallback: must wait out GroupChat queue
                     )
                     msg = resp.json()["choices"][0]["message"]
                     reply = self._extract_vlm_reply(msg)
@@ -4875,27 +5076,71 @@ class CaptainPipeline:
         _goals_preamble = ""
         if _stage and _stage.goals:
             _goals_block = "\n".join(f"  - {g}" for g in _stage.goals)
-            _goals_preamble = f"ANALYSIS GOALS (from context):\n{_goals_block}\n\n"
+            _goals_preamble = f"ANALYSIS GOALS (from context):\n{_goals_block}\n"
+            if _stage.grouping_guidance:
+                _goals_preamble += f"\nGROUPING GUIDANCE:\n{_stage.grouping_guidance}\n"
+            _goals_preamble += "\n"
 
         _custom_suffix = ""
         if _stage and _stage.custom_instructions:
             _custom_suffix = f"\n\n{_stage.custom_instructions}"
 
+        # ── Build a condensed profile summary for the planner ──
+        _profile_summary = ""
+        if _data_profile is not None:
+            _ps_lines: list[str] = []
+            _ps_lines.append("DATA PROFILE SUMMARY (forward this to the planner):")
+            ds = _data_profile.dimensional_structure
+            if ds and ds.dimensions:
+                _ps_lines.append("  Dimensions (hierarchy):")
+                for dim in ds.dimensions:
+                    _parent = f" within {dim.nesting_parent}" if dim.nesting_parent else " (outermost)"
+                    _vals = f" — e.g. {', '.join(str(v) for v in dim.sample_values[:4])}" if dim.sample_values else ""
+                    _ps_lines.append(
+                        f"    {dim.name}: {dim.cardinality} levels "
+                        f"[{dim.semantic_purpose}]{_parent}{_vals}"
+                    )
+            if ds and ds.analysis_contexts:
+                _ps_lines.append("  Analysis contexts:")
+                for ac in ds.analysis_contexts:
+                    _ps_lines.append(
+                        f"    {ac.name}: group by ({', '.join(ac.group_by)}), "
+                        f"compare across {ac.compare_across}. Use for: {ac.use_case}"
+                    )
+            rg = _data_profile.recommended_grouping
+            if rg:
+                _ps_lines.append(f"  Default grouping: ({', '.join(rg.columns)}) → {rg.group_count} groups")
+            eg = _data_profile.extended_grouping
+            if eg:
+                _ps_lines.append(f"  Extended grouping: ({', '.join(eg.columns)}) → {eg.group_count} groups")
+            _profile_summary = "\n".join(_ps_lines) + "\n"
+
         # Build instruction body
         if use_two_pass:
             _strategy_block = (
                 "TWO-PASS ANALYSIS STRATEGY — follow this sequence:\n"
-                "1. First seek_experts_help call: Consult the analysis_planner agent. "
-                "Ask it: 'Given this dataset has domains "
-                f"{required_agents} and groups {group_cols}, recommend 5-8 diverse "
-                "plot types and analytical angles that would be most informative — "
-                "include at least 3 different chart types (e.g. heatmap, trend line, "
-                "scatter, KDE histogram, bar chart) in addition to standard overlays.'\n"
+                "1. First seek_experts_help call: Consult the analysis_planner agent.\n"
+                "   In your execution_task to the planner, you MUST include:\n"
+                "   (a) The FULL 'instructions' field from this payload (it contains\n"
+                "       the DATA PROFILE with column roles, dimensional structure,\n"
+                "       analysis contexts, and grouping guidance).\n"
+                "   (b) The group_summary and domain_hints.\n"
+                "   Ask: 'Using the DATA PROFILE below, produce a structured JSON\n"
+                "   analysis plan (5-8 entries, ≥3 chart types). Each plan entry MUST\n"
+                "   reference the dimensional structure — specify which grouping\n"
+                "   context to use and which dimensions to compare.'\n"
+                f"  {_profile_summary}"
+                "   The planner will return a JSON array — this is the ANALYSIS PLAN.\n\n"
                 "2. Second seek_experts_help call: Delegate execution to the domain "
                 f"expert(s): {required_agents}. You MUST include ALL of these in your "
-                "team.  Pass the analysis_planner's strategy as additional context. "
-                "The domain expert generates plots and per-group statistics "
-                "following the recommended analytical variety.\n\n"
+                "team.\n"
+                "   CRITICAL: In your task message to the experts, include the FULL "
+                "JSON analysis plan from the planner verbatim. Prefix it with:\n"
+                "     'ANALYSIS PLAN (from planner — use as starting framework):\\n'\n"
+                "   followed by the JSON array.  The domain expert's system prompt \n"
+                "   instructs it to use this plan as a starting framework and expand \n"
+                "   upon it with their own domain expertise.  Do NOT paraphrase or \n"
+                "   summarise the plan — pass the JSON as-is so the expert can parse it.\n\n"
             )
         else:
             _strategy_block = (
@@ -4955,7 +5200,7 @@ class CaptainPipeline:
 
         # ── NaN warnings for grouping columns ──
         _nan_warnings: List[str] = []
-        for _gcol, _ginfo in groups.items():
+        for _gcol, _ginfo in group_summary.get("groups", {}).items():
             _nan_pct = _ginfo.get("nan_pct", 0)
             if _nan_pct > 10:
                 _nan_warnings.append(
@@ -5490,6 +5735,15 @@ class CaptainPipeline:
             except Exception:
                 pass
 
+        # Forward data_profile so cross-validator can verify grouping choices
+        _xval_data_profile = {}
+        _profile_path = Path(analysis_summary_path).parent / "data_profile.json" if analysis_summary_path else None
+        if _profile_path and _profile_path.exists():
+            try:
+                _xval_data_profile = json.loads(_profile_path.read_text("utf-8"))
+            except Exception:
+                pass
+
         payload = {
             "stage": "cross_validation",
             "available_columns": _xval_evidence.get("columns", []),
@@ -5515,6 +5769,9 @@ class CaptainPipeline:
                 + _fallback_instructions
             ),
         }
+
+        if _xval_data_profile:
+            payload["data_profile"] = _xval_data_profile
 
         reply = self._run_with_captain(
             payload, tolerant_validation_payload,
@@ -5650,12 +5907,17 @@ class CaptainPipeline:
         file_name = payload.get("file_name", "unknown")
         sections.append(f"Write a scientific analysis report for **{file_name}**.\n")
 
+        # BS-4: payload budgets from run_config (context.md-driven)
+        _budget_cleaning = self.run_config.payload_budget_cleaning
+        _budget_analysis = self.run_config.payload_budget_analysis
+        _budget_per_file = self.run_config.payload_budget_per_file
+
         # Cleaning summary
         cleaning = payload.get("cleaning_summary", payload.get("cleaning_result", {}).get("summary", {}))
         if cleaning:
             sections.append(
                 f"## Cleaning Summary\n```json\n"
-                f"{json.dumps(cleaning, indent=2, default=str)[:3000]}\n```\n"
+                f"{json.dumps(cleaning, indent=2, default=str)[:_budget_cleaning]}\n```\n"
             )
 
         # Analysis summary (from disk)
@@ -5674,7 +5936,7 @@ class CaptainPipeline:
                                 "anova_p_values", "notes")}
             sections.append(
                 f"## Analysis Summary\n```json\n"
-                f"{json.dumps(compact, indent=2, default=str)[:5000]}\n```\n"
+                f"{json.dumps(compact, indent=2, default=str)[:_budget_analysis]}\n```\n"
             )
 
         # Cross-validation
@@ -5719,7 +5981,7 @@ class CaptainPipeline:
         per_file_analysis = payload.get("per_file_analysis", {})
         if per_file_analysis:
             for _pf_name, _pf_data in list(per_file_analysis.items())[:10]:
-                _compact_str = json.dumps(_pf_data, indent=2, default=str)[:2000]
+                _compact_str = json.dumps(_pf_data, indent=2, default=str)[:_budget_per_file]
                 sections.append(
                     f"## Analysis Summary: {_pf_name}\n```json\n{_compact_str}\n```\n"
                 )

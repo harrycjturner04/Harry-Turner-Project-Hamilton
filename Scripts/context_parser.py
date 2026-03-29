@@ -41,7 +41,7 @@ DEFAULT_STAGE_ORDER = ["cleaning", "analysis", "cross_validation", "report"]
 
 DEFAULT_MAX_RETRIES = {
     "cleaning": 2,
-    "analysis": 2,
+    "analysis": 3,
     "cross_validation": 1,
     "report": 0,
 }
@@ -79,7 +79,7 @@ class RunConfig:
     Every field has a safe default that reproduces baseline behaviour.
     """
     run_label: str = ""                     # human-readable label for this run
-    prompt_version: str = "v1"              # "v1" = baseline, "v2" = enhanced (WP4/WP8)
+    prompt_version: str = "v1"              # "v1" = baseline, "v2" = enhanced, "v3" = graduated guidance
     # NOTE: critic_fail_safe and critic_max_attempts removed — the gated review
     # system now runs content evaluation on every attempt and uses structural_gate()
     # as the safety net when the evaluator LLM fails.
@@ -88,25 +88,36 @@ class RunConfig:
     recompute_cross_val: bool = False       # WP5: recompute metrics from parquet (fix tautological)
     figure_selection: str = "all"           # WP6: "all"|"ranked"|"top_n"
     max_report_figures: int = 10            # WP6: max figures when using ranked/top_n
-    rerun_issue_map_enabled: bool = False   # WP9: inject targeted retry instructions
     protected_col_audit: bool = False       # WP10: warn on >95% missing protected columns
     schema_profiling: str = "disabled"      # WP-1A: "disabled"|"roles_only"|"full"
     visual_review_mode: str = "basic"       # WP-3: "basic"|"scientific"
     require_figure_references: bool = False  # WP-3: enforce claim-figure mapping
     iteration_strategy: str = "fixed"       # WP-2: "none"|"fixed"|"convergent"
-    convergence_threshold: float = 0.05     # WP-2: min improvement to continue iterating
-    convergence_target: float = 0.85        # WP-2: quality score at which to stop early
+    convergence_threshold: float = 0.03     # WP-2: min improvement to continue iterating
+    convergence_target: float = 0.92        # WP-2: quality score at which to stop early
+    should_fix_accumulation_threshold: int = 4  # retry if >= this many SHOULD_FIX
+    issue_stall_max_consecutive: int = 4    # downgrade persistent issue after N attempts
     expert_library: str = "baseline"        # WP-4: "baseline"|"extended"
     agent_definitions_dir: str = "agents/"  # WP-4: path to agent YAML files
+    # BS-4: Payload budget controls (chars) for report prompt assembly.
+    # These drive the truncation limits in _build_report_prompt() and
+    # report_pipeline global report.  Tuned for 128K context window.
+    payload_budget_cleaning: int = 4000     # cleaning summary JSON slice
+    payload_budget_analysis: int = 8000     # analysis summary JSON slice
+    payload_budget_per_file: int = 3000     # per-file analysis in global reports
+    payload_budget_global: int = 40000      # global report payload JSON slice
+    payload_budget_report_excerpt: int = 10000  # individual report excerpt in report_pipeline
     # WP-C1: Per-critic module toggles (backward-compatible defaults)
     critic_structural: bool = True          # structural gate (always-on by default)
     critic_content: bool = True             # LLM content evaluator
     critic_visual: bool = True              # VLM plot reviewer
     critic_analytical_depth: bool = False   # WP-C3a: analytical depth (off until validated)
-    critic_execution: bool = False          # WP-C3b: execution correctness (off until validated)
+    critic_execution: bool = True           # WP-C3b: pure-Python, no LLM needed
     # WP-C2: Targeted refinement toggles
     targeted_refinement: bool = False       # enable finding_fix / gap_fill paths
     refinement_cascade: bool = False        # enable escalation cascade
+    ml_backend: str = "sklearn"              # "sklearn"|"tabpfn"|"both" — ML modeler backend
+    max_input_tokens: int = 65_000           # token budget for trim_payload_to_budget
 
     def to_dict(self) -> Dict[str, Any]:
         return _asdict(self)
@@ -146,6 +157,7 @@ class StageSpec:
     max_rounds: int = 0  # 0 = use pipeline default (_STAGE_MAX_ROUNDS)
     chat_timeout: int = 0  # 0 = use global PIPELINE_CHAT_TIMEOUT_S / default
     custom_instructions: Optional[str] = None
+    grouping_guidance: Optional[str] = None  # WP-1: data-structure-aware grouping guidance
 
 
 @dataclass
@@ -373,6 +385,7 @@ def _build_stage_spec(raw: Dict[str, Any]) -> Optional[StageSpec]:
             DEFAULT_CHAT_TIMEOUTS.get(name, 0),
         )),
         custom_instructions=raw.get("custom_instructions"),
+        grouping_guidance=raw.get("grouping_guidance"),
     )
 
 
@@ -396,7 +409,6 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
         recompute_cross_val=bool(raw.get("recompute_cross_val", defaults.recompute_cross_val)),
         figure_selection=str(raw.get("figure_selection", defaults.figure_selection)),
         max_report_figures=int(raw.get("max_report_figures", defaults.max_report_figures)),
-        rerun_issue_map_enabled=bool(raw.get("rerun_issue_map_enabled", defaults.rerun_issue_map_enabled)),
         protected_col_audit=bool(raw.get("protected_col_audit", defaults.protected_col_audit)),
         schema_profiling=str(raw.get("schema_profiling", defaults.schema_profiling)),
         visual_review_mode=str(raw.get("visual_review_mode", defaults.visual_review_mode)),
@@ -406,6 +418,12 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
         convergence_target=float(raw.get("convergence_target", defaults.convergence_target)),
         expert_library=str(raw.get("expert_library", defaults.expert_library)),
         agent_definitions_dir=str(raw.get("agent_definitions_dir", defaults.agent_definitions_dir)),
+        # BS-4: Payload budget controls
+        payload_budget_cleaning=int(raw.get("payload_budget_cleaning", defaults.payload_budget_cleaning)),
+        payload_budget_analysis=int(raw.get("payload_budget_analysis", defaults.payload_budget_analysis)),
+        payload_budget_per_file=int(raw.get("payload_budget_per_file", defaults.payload_budget_per_file)),
+        payload_budget_global=int(raw.get("payload_budget_global", defaults.payload_budget_global)),
+        payload_budget_report_excerpt=int(raw.get("payload_budget_report_excerpt", defaults.payload_budget_report_excerpt)),
         # WP-C1: Per-critic module toggles
         critic_structural=bool(raw.get("critic_structural", defaults.critic_structural)),
         critic_content=bool(raw.get("critic_content", defaults.critic_content)),
@@ -415,6 +433,8 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
         # WP-C2: Targeted refinement toggles
         targeted_refinement=bool(raw.get("targeted_refinement", defaults.targeted_refinement)),
         refinement_cascade=bool(raw.get("refinement_cascade", defaults.refinement_cascade)),
+        # TabPFN integration
+        ml_backend=str(raw.get("ml_backend", defaults.ml_backend)),
     )
     if cfg.visual_review_mode not in ("basic", "scientific"):
         logger.warning(
@@ -440,7 +460,7 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
             cfg.figure_selection,
         )
         cfg.figure_selection = "all"
-    if cfg.prompt_version not in ("v1", "v2"):
+    if cfg.prompt_version not in ("v1", "v2", "v3"):
         logger.warning(
             "run_config.prompt_version='%s' invalid, defaulting to 'v1'",
             cfg.prompt_version,
@@ -452,6 +472,12 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
             cfg.expert_library,
         )
         cfg.expert_library = "baseline"
+    if cfg.ml_backend not in ("sklearn", "tabpfn", "both"):
+        logger.warning(
+            "run_config.ml_backend='%s' invalid, defaulting to 'sklearn'",
+            cfg.ml_backend,
+        )
+        cfg.ml_backend = "sklearn"
     return cfg
 
 
