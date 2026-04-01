@@ -89,6 +89,14 @@ def main() -> int:
 
     llm_config = _build_llm_config(args.model, args.temperature, args.api_key, args.base_url)
 
+    # Prevent runaway generation in ALL pipeline calls.  The report_pipeline
+    # does not set max_tokens internally; without this guard vLLM will generate
+    # indefinitely (streaming chunks arrive every ~16 ms, bypassing the httpx
+    # read timeout) causing multi-hour hangs before the SLURM wall time kills the job.
+    _MAX_TOKENS = int(os.environ.get("PIPELINE_MAX_TOKENS", "32768"))
+    for _entry in llm_config["config_list"]:
+        _entry.setdefault("max_tokens", _MAX_TOKENS)
+
     # Create ServerManager if vLLM server PID and port are available
     server_manager = None
     vllm_pid = os.environ.get("VLLM_PID")

@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from tools import CheckCategory, CheckResult, Severity
+from tools import CheckCategory, CheckResult, Severity, finding_text
 from critics.base import CriticContext, CriticModule
 
 logger = logging.getLogger("captain_pipeline")
@@ -231,7 +231,7 @@ class ExecutionCritic(CriticModule):
         mismatches: List[str] = []
 
         for i, finding in enumerate(findings):
-            f_str = str(finding)
+            f_str = finding_text(finding)
             # Look for group references like "Run R4", "R16__E4", etc.
             refs = re.findall(r'(?:Run\s+)?([A-Z]\d+(?:__[A-Z]\d+)*)', f_str)
             for ref in refs:
@@ -279,7 +279,13 @@ class ExecutionCritic(CriticModule):
         if not png_names or not findings:
             return []
 
-        findings_text = " ".join(str(f) for f in findings).lower()
+        # Build search corpus: finding text + figure_ref/figure fields from dict findings
+        _parts = [finding_text(f) for f in findings]
+        for f in findings:
+            if isinstance(f, dict):
+                _parts.append(str(f.get("figure_ref", "")))
+                _parts.append(str(f.get("figure", "")))
+        findings_text = " ".join(_parts).lower()
         # Look for figure references like "Figure 1", "fig_01", plot filenames
         missing_refs: List[str] = []
         for png in png_names:
@@ -339,6 +345,21 @@ class ExecutionCritic(CriticModule):
 
         unique_p = set(p_values)
         if len(unique_p) == 1 and len(p_values) >= 3:
+            # Large-sample guard: p=0.0 is legitimate float64 underflow when
+            # group sizes exceed ~100K rows.  Don't flag as copy-paste in that case.
+            if p_values[0] == 0.0:
+                per_group = summary.get("per_group", summary.get("per_run_per_stage", {}))
+                if isinstance(per_group, dict) and per_group:
+                    _sizes = [
+                        v.get("row_count", 0)
+                        for v in per_group.values()
+                        if isinstance(v, dict) and v.get("row_count", 0) > 0
+                    ]
+                    if _sizes:
+                        _median_n = sorted(_sizes)[len(_sizes) // 2]
+                        if _median_n > 10_000:
+                            return []  # p=0.0 expected for large N
+
             return [CheckResult(
                 name="exec__duplicate_pvalues",
                 passed=False,

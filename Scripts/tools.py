@@ -153,10 +153,22 @@ class QualityScoreBreakdown:
 # Expected criteria counts per stage (from rubric definitions in prompts.py)
 _EXPECTED_CRITERIA_COUNT: Dict[str, int] = {
     "cleaning": 4,        # justification, conservatism, preservation, informativeness
-    "analysis": 6,        # per_group_depth, domain_methods, plot_diversity, insight_quality,
-                          # interpretation_depth, statistical_rigor
+    "analysis": 8,        # per_group_depth, domain_methods, plot_diversity, insight_quality,
+                          # interpretation_depth, statistical_rigor, domain_contribution,
+                          # context_coverage
     "cross_validation": 3, # recomputation, tolerance, claim_selection
 }
+
+
+def finding_text(finding) -> str:
+    """Extract plain text from a finding (dict or legacy string).
+
+    Findings may be plain strings (legacy format) or dicts with ``text``
+    and ``figure_ref`` keys (new schema).  This helper normalises both.
+    """
+    if isinstance(finding, dict):
+        return finding.get("text", str(finding))
+    return str(finding)
 
 
 def _score_check_list(checks: List[CheckResult]) -> float:
@@ -183,17 +195,20 @@ def compute_quality_score(
       - passed check = 1.0
       - should_fix check = 0.5
       - must_fix check = 0.0
-    Structural checks get 1x weight, content/plot checks get 2x weight.
+    Structural checks get 1x weight, content checks get 2x weight.
+    VLM plot checks get 2x weight normalised by the number of criteria
+    per plot: each plot's complete VLM evaluation contributes exactly 2.0
+    to the total weight regardless of how many sub-criteria were assessed.
+    This prevents VLM criterion counts (11–12 per plot × N plots) from
+    numerically swamping the 7 content criteria and masking content failures.
 
     If *evaluators_ran* is provided and key LLM/VLM evaluators were skipped,
     a coverage penalty is applied (-0.05 per skipped evaluator) to prevent
     inflated scores from incomplete evaluation.
 
-    Hard-cap rule: any must_fix check caps the final
-    score at 0.80, ensuring the convergent strategy (target 0.85) will
-    always trigger a retry for substantive quality failures.
-
     Returns the weighted mean across all checks. Returns 1.0 if no checks exist.
+    Must-fix enforcement is handled by the quality gate's explicit must-fix
+    check — the score reflects actual quality distribution across dimensions.
     """
     all_checks = (
         verdict.structural_checks
@@ -204,14 +219,27 @@ def compute_quality_score(
     if not all_checks:
         return 1.0
 
+    # Pre-compute per-plot criterion counts for VLM normalisation.
+    # Group PLOT_QUALITY checks by their ref (plot filename).  Checks without
+    # a ref are grouped under the sentinel None and treated as a single plot.
+    from collections import Counter as _Counter
+    _plot_criteria_counts: dict = _Counter(
+        c.ref for c in all_checks if c.category == CheckCategory.PLOT_QUALITY
+    )
+    _n_plot_refs = len(_plot_criteria_counts) or 1
+
     total_weight = 0.0
     weighted_sum = 0.0
-    has_any_must_fix = False
     for check in all_checks:
-        # Content and plot checks get higher weight
-        weight = 2.0 if check.category in (
-            CheckCategory.CONTENT_QUALITY, CheckCategory.PLOT_QUALITY,
-        ) else 1.0
+        if check.category == CheckCategory.PLOT_QUALITY:
+            # Normalise: the whole VLM evaluation of one plot = 2.0 weight.
+            # Each criterion within a plot gets weight = 2.0 / criteria_count.
+            _criteria_for_this_plot = _plot_criteria_counts.get(check.ref, 1)
+            weight = 2.0 / _criteria_for_this_plot
+        elif check.category == CheckCategory.CONTENT_QUALITY:
+            weight = 2.0
+        else:
+            weight = 1.0
 
         if check.passed:
             score = 1.0
@@ -219,27 +247,11 @@ def compute_quality_score(
             score = 0.5
         else:  # MUST_FIX or unknown
             score = 0.0
-            has_any_must_fix = True
 
         weighted_sum += weight * score
         total_weight += weight
 
     raw_score = round(weighted_sum / total_weight, 4) if total_weight > 0 else 1.0
-
-    # Hard cap: ANY must_fix (structural, content, or plot) is a substantive
-    # failure that should not be silently accepted by convergent early-stop.
-    if has_any_must_fix:
-        raw_score = min(raw_score, 0.80)
-
-    # Soft cap: many SHOULD_FIX on content/plot prevents convergent
-    # early-stop at the target (0.85).
-    sf_content_count = sum(
-        1 for c in all_checks
-        if not c.passed and c.severity == Severity.SHOULD_FIX
-        and c.category in (CheckCategory.CONTENT_QUALITY, CheckCategory.PLOT_QUALITY)
-    )
-    if sf_content_count > 3:
-        raw_score = min(raw_score, 0.85)
 
     # Coverage penalty: if LLM/VLM evaluators were expected but did not run,
     # the score is inflated by their absence.  Apply -0.05 per skipped
@@ -747,12 +759,12 @@ def estimate_tokens(text: str) -> int:
 
 
 def trim_payload_to_budget(
-    payload: Dict[str, Any], max_input_tokens: int = 65_000
+    payload: Dict[str, Any], max_input_tokens: int = 55_000
 ) -> Dict[str, Any]:
     """Progressively trim payload fields to fit within token budget.
 
-    Default budget of 65K leaves headroom for system
-    prompt (~2K), agent library (~3K), conversation history (~50K), and
+    Default budget of 55K leaves headroom for system
+    prompt (~2K), agent library (~3K), conversation history (~60K), and
     format suffixes (~2K) within the model's 131K+ effective context window.
 
     Trimming order (least → most analytically valuable):
@@ -1081,14 +1093,19 @@ def structural_gate(
                     orphaned = []
                     for idx, f in enumerate(findings):
                         if isinstance(f, dict):
-                            fig_ref = f.get("figure", "")
+                            # Accept both 'figure_ref' (new) and 'figure' (legacy)
+                            fig_ref = f.get("figure_ref") or f.get("figure", "")
                             if not fig_ref:
-                                orphaned.append(f"finding[{idx}]: missing 'figure' key")
+                                orphaned.append(f"finding[{idx}]: missing 'figure_ref' key")
                             elif fig_ref not in disk_pngs:
-                                orphaned.append(
-                                    f"finding[{idx}]: references '{fig_ref}' "
-                                    "which does not exist on disk"
-                                )
+                                # Also try stem matching (ref may omit .png)
+                                ref_stem = Path(fig_ref).stem.lower()
+                                disk_stems = {Path(p).stem.lower() for p in disk_pngs}
+                                if ref_stem not in disk_stems:
+                                    orphaned.append(
+                                        f"finding[{idx}]: references '{fig_ref}' "
+                                        "which does not exist on disk"
+                                    )
                         # If findings are plain strings (baseline format),
                         # skip traceability — no breakage when disabled
                     if orphaned:
@@ -1103,9 +1120,8 @@ def structural_gate(
                             ),
                             fix_instruction=(
                                 "Each finding in analysis_summary.json should be a dict with "
-                                "a 'figure' key pointing to an existing PNG filename. "
-                                "Format: {\"text\": \"...\", \"figure\": \"01_overlay.png\", "
-                                "\"metric\": \"max_uv_280\"}"
+                                "a 'figure_ref' key pointing to an existing PNG filename. "
+                                "Format: {\"text\": \"...\", \"figure_ref\": \"01_overlay.png\"}"
                             ),
                         ))
                     else:
@@ -1138,6 +1154,46 @@ def structural_gate(
                         name="per_run_per_stage_present", passed=True,
                         category=CheckCategory.STRUCTURAL,
                         detail="per_run_per_stage or per_group key present",
+                    ))
+
+                # ── domain_reasoning completeness ──
+                dr = data.get("domain_reasoning", {})
+                if not isinstance(dr, dict):
+                    dr = {}
+                mods = dr.get("plan_modifications_applied", [])
+                obs = dr.get("unexpected_observations", [])
+                dr_missing = []
+                if not mods:
+                    dr_missing.append("plan_modifications_applied is empty")
+                if not obs:
+                    dr_missing.append("unexpected_observations is empty")
+                if dr_missing:
+                    checks.append(CheckResult(
+                        name="domain_reasoning_completeness",
+                        passed=False,
+                        severity=Severity.SHOULD_FIX,
+                        category=CheckCategory.STRUCTURAL,
+                        detail=(
+                            "domain_reasoning incomplete: "
+                            + "; ".join(dr_missing)
+                        ),
+                        fix_instruction=(
+                            "Populate 'domain_reasoning' in analysis_summary.json. "
+                            "'plan_modifications_applied' should list at least one "
+                            "adaptation made during analysis. "
+                            "'unexpected_observations' should list at least one "
+                            "observation that was not anticipated."
+                        ),
+                    ))
+                else:
+                    checks.append(CheckResult(
+                        name="domain_reasoning_completeness",
+                        passed=True,
+                        category=CheckCategory.STRUCTURAL,
+                        detail=(
+                            f"domain_reasoning present: {len(mods)} modification(s), "
+                            f"{len(obs)} observation(s)"
+                        ),
                     ))
 
             except json.JSONDecodeError:
@@ -1197,6 +1253,8 @@ def quality_gate(
     max_retries: int,
     previous_verdict: Optional[StageVerdict] = None,
     sf_accumulation_threshold: int = 4,
+    stall_count: int = 0,
+    issue_stall_max_consecutive: int = 4,
 ) -> GateResult:
     """Deterministic gate decision based on aggregated check results.
 
@@ -1299,42 +1357,18 @@ def quality_gate(
             ] + [c.detail for c in must_fix],
         )
 
-    # Stall detection: same must_fix checks failed as previous attempt
-    if previous_verdict is not None:
-        prev_names = {c.name for c in previous_verdict.must_fix_failures()}
-        curr_names = {c.name for c in must_fix}
-        if curr_names and curr_names == prev_names:
-            verdict.overall_passed = True
-            verdict.gate_decision = "pass_with_warnings"
-            return _make_result(
-                status="passed_degraded", verdict=verdict,
-                warnings=[
-                    "Stall detected: identical must_fix failures as previous attempt"
-                ] + [c.detail for c in must_fix],
-            )
-
-    # Substantive-findings exemption: if the stage produced real findings
-    # (min_findings passed) and the only MUST_FIX failures are from
-    # analytical_depth or interpretation checks, accept as degraded rather
-    # than risking a retry that might destroy the existing findings.
-    _DEPTH_ONLY_PREFIXES = ("depth__",)
-    _INTERP_NAMES = {"interpretation_depth", "insight_quality"}
-    _depth_only_must_fix = all(
-        c.name.startswith(_DEPTH_ONLY_PREFIXES) or c.name in _INTERP_NAMES
-        for c in must_fix
-    )
-    _has_findings = any(
-        c.name == "min_findings" and c.passed
-        for c in verdict.structural_checks
-    )
-    if _depth_only_must_fix and _has_findings and must_fix:
+    # Stall detection: same must_fix checks failed across consecutive attempts.
+    # Only accept degraded after issue_stall_max_consecutive identical failures
+    # (tracked via stall_count passed in from run_stage_gated).
+    if stall_count >= issue_stall_max_consecutive:
         verdict.overall_passed = True
         verdict.gate_decision = "pass_with_warnings"
         return _make_result(
             status="passed_degraded", verdict=verdict,
             warnings=[
-                f"Substantive findings present; {len(must_fix)} depth/interpretation "
-                "issues accepted as advisory to protect existing analysis"
+                f"Stall detected: identical must_fix failures for "
+                f"{stall_count} consecutive attempts (threshold: "
+                f"{issue_stall_max_consecutive})"
             ] + [c.detail for c in must_fix],
         )
 
@@ -1410,23 +1444,44 @@ def quality_gate(
     )
 
 
+_CATEGORY_PRIORITY = {
+    CheckCategory.STRUCTURAL: 0,
+    CheckCategory.CONTENT_QUALITY: 1,
+    CheckCategory.PLOT_QUALITY: 2,
+}
+
+_MAX_RETRY_ITEMS = 10
+
+
 def _build_retry_text(failures: List[CheckResult]) -> str:
     """Build structured retry instructions from a list of failing checks.
 
-    Tells the agent what to fix and explicitly instructs it to preserve
-    aspects that passed.
+    Caps to the top 5 most critical issues (structural > content > visual)
+    and instructs the agent to preserve passing aspects.
     """
     if not failures:
         return ""
-    lines = [f"REVISION REQUIRED ({len(failures)} issue(s)):"]
-    for i, f in enumerate(failures, 1):
+
+    # Prioritise: structural > content > visual, then by severity
+    sorted_failures = sorted(
+        failures,
+        key=lambda c: (
+            _CATEGORY_PRIORITY.get(c.category, 99),
+            0 if c.severity == Severity.MUST_FIX else 1,
+        ),
+    )
+    top = sorted_failures[:_MAX_RETRY_ITEMS]
+    omitted = len(failures) - len(top)
+
+    lines = [f"FOCUS: Address these {len(top)} critical issues. "
+             "All other aspects were acceptable — preserve them."]
+    for i, f in enumerate(top, 1):
         lines.append(f"  {i}. [{f.name}] {f.fix_instruction}")
         if f.ref:
             lines.append(f"     Affected: {f.ref}")
-    lines.append(
-        "\nAddress ALL items above. Other aspects of your output were "
-        "acceptable — preserve them."
-    )
+    if omitted:
+        lines.append(f"\n({omitted} lower-priority issues omitted — "
+                     "fix the above first.)")
     return "\n".join(lines)
 
 

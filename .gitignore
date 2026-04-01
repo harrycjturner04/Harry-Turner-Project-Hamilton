@@ -38,3 +38,5 @@ knowledge_base/
 # Evaluation framework
 evaluation_config.yaml
 Evaluation/
+
+diagrams/

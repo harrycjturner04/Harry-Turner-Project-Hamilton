@@ -39,7 +39,7 @@ _IDENTIFIER_RATIO_FLOOR = 0.95      # unique/row_count above this → likely ide
 _METADATA_TEXT_MIN_MEDIAN_LEN = 20  # median string length above this → metadata text
 
 # Grouping inference
-_MIN_GROUPS = 3                     # minimum useful group count
+_MIN_GROUPS = 2                     # minimum useful group count (2 = binary/pairwise designs)
 _MAX_GROUPS = 200                   # maximum before grouping becomes unwieldy
 _MIN_ROWS_PER_GROUP = 5             # each group should have at least this many rows
 _IDEAL_GROUP_RANGE = (5, 100)       # preferred range for group count scoring
@@ -488,18 +488,27 @@ def _score_grouping(
     median_group_size: float,
     size_cv: float,
     rows_covered_pct: float,
+    *,
+    discriminability: float = 0.0,
+    has_ordinal: bool = False,
 ) -> float:
     """Score a candidate grouping on a 0-1 scale.
 
     Higher = better. Considers:
-    - group_count in ideal range (5-50)
+    - group_count in ideal range (2-100)
     - minimum group size (>= _MIN_ROWS_PER_GROUP)
-    - evenness of group sizes (low CV)
+    - discriminability: CV of measurement means across groups (high = good —
+      the grouping separates the data along a dimension with meaningful
+      variation). Falls back to evenness (low size_cv) when no measurement
+      data is available.
     - row coverage (high = good)
+    - ordinal bonus: groupings containing ordinal stages receive a 0.15
+      bonus (capped at 1.0) because ordinal dimensions typically encode
+      process phases with analytically meaningful progression.
     """
     score = 0.0
 
-    # Group count score (0-0.35): prefer 5-50 groups
+    # Group count score (0-0.35): prefer 5-100 groups, accept down to 2
     if _IDEAL_GROUP_RANGE[0] <= group_count <= _IDEAL_GROUP_RANGE[1]:
         score += 0.35
     elif _MIN_GROUPS <= group_count <= _MAX_GROUPS:
@@ -517,14 +526,30 @@ def _score_grouping(
     elif min_group_size >= 2:
         score += 0.25 * (min_group_size / _MIN_ROWS_PER_GROUP)
 
-    # Evenness score (0-0.20): low CV is better
-    evenness = max(0, 1.0 - size_cv) if size_cv < 2.0 else 0.0
-    score += 0.20 * evenness
+    # Discriminability score (0-0.20): does this grouping separate
+    # the data along a dimension with meaningful measurement variation?
+    # When discriminability is available (CV of group measurement means),
+    # a higher CV means the grouping captures real analytical structure.
+    # Falls back to evenness (inverse of size_cv) when no measurement data.
+    if discriminability > 0:
+        # Saturates at CV=1.0 (100% variation explained)
+        disc_score = min(discriminability, 1.0)
+        score += 0.20 * disc_score
+    else:
+        # Fallback: evenness (low size_cv is better)
+        evenness = max(0, 1.0 - size_cv) if size_cv < 2.0 else 0.0
+        score += 0.20 * evenness
 
     # Coverage score (0-0.20)
     score += 0.20 * (rows_covered_pct / 100.0)
 
-    return round(score, 4)
+    # Ordinal bonus: ordinal stages typically encode process phases
+    # with analytically meaningful progression (e.g. chromatography
+    # stages E1→E2→W1→W2). Boost these groupings.
+    if has_ordinal:
+        score += 0.15
+
+    return round(min(score, 1.0), 4)
 
 
 def _evaluate_grouping(
@@ -532,6 +557,8 @@ def _evaluate_grouping(
     columns: List[str],
     *,
     max_groups: int = _MAX_GROUPS,
+    measurement_cols: Optional[List[str]] = None,
+    column_roles: Optional[Dict[str, str]] = None,
 ) -> Optional[GroupingCandidate]:
     """Evaluate a specific set of columns as a compound grouping key.
 
@@ -548,6 +575,12 @@ def _evaluate_grouping(
             enumeration.  For user-directed context extensions, callers
             can pass a higher ceiling so that analytically meaningful
             but higher-cardinality groupings are not rejected.
+        measurement_cols: Optional list of continuous measurement column
+            names.  When provided, computes discriminability (CV of group
+            means) to reward groupings that separate the data along
+            dimensions with meaningful measurement variation.
+        column_roles: Optional mapping of column name → role string.
+            Used to detect ordinal_stage columns for the scoring bonus.
     """
     # Check all columns exist
     missing = [c for c in columns if c not in df.columns]
@@ -575,7 +608,37 @@ def _evaluate_grouping(
     std_size = float(group_sizes.std()) if group_count > 1 else 0.0
     cv = std_size / mean_size if mean_size > 0 else 0.0
 
-    score = _score_grouping(group_count, min_size, median_size, cv, rows_covered_pct)
+    # Compute discriminability: how much do measurement means vary across
+    # groups?  High CV of group means = grouping separates real structure.
+    discriminability = 0.0
+    if measurement_cols and group_count >= 2:
+        usable_mcols = [c for c in measurement_cols if c in df.columns]
+        if usable_mcols:
+            try:
+                # Use the rows that survived the grouping-column NaN filter
+                meas_df = df.loc[subset.index, usable_mcols + columns]
+                group_means = meas_df.groupby(columns, sort=False)[usable_mcols].mean()
+                # CV of group means for each measurement, then take the median
+                disc_per_col = []
+                for mc in usable_mcols:
+                    gm = group_means[mc].dropna()
+                    if len(gm) >= 2 and gm.mean() != 0:
+                        disc_per_col.append(abs(gm.std() / gm.mean()))
+                if disc_per_col:
+                    discriminability = float(np.median(disc_per_col))
+            except Exception:
+                pass  # fall back to evenness in scorer
+
+    # Detect if any grouping column is ordinal
+    has_ordinal = False
+    if column_roles:
+        has_ordinal = any(column_roles.get(c) == "ordinal_stage" for c in columns)
+
+    score = _score_grouping(
+        group_count, min_size, median_size, cv, rows_covered_pct,
+        discriminability=discriminability,
+        has_ordinal=has_ordinal,
+    )
 
     # Apply coverage penalty for partial-null grouping columns so that
     # higher-coverage groupings are preferred when scores are close, but
@@ -624,12 +687,23 @@ def _infer_grouping_candidates(
     if not candidate_cols:
         return []
 
+    # Build auxiliary data for discriminability scoring
+    measurement_cols = [
+        cp.name for cp in column_profiles
+        if cp.role == "continuous_measurement"
+    ]
+    column_roles = {cp.name: cp.role for cp in column_profiles}
+
     candidates: List[GroupingCandidate] = []
 
     # Evaluate all combinations of 1, 2, and 3 columns
     for n_cols in range(1, min(_MAX_GROUPING_COMBO_COLUMNS + 1, len(candidate_cols) + 1)):
         for combo in combinations(candidate_cols, n_cols):
-            gc = _evaluate_grouping(df, list(combo))
+            gc = _evaluate_grouping(
+                df, list(combo),
+                measurement_cols=measurement_cols,
+                column_roles=column_roles,
+            )
             if gc is not None:
                 # Apply semantic quality multiplier if purposes are classified
                 mult = _semantic_quality_multiplier(list(combo), column_profiles)
@@ -710,6 +784,13 @@ def _compose_semantic_grouping(
     if not available:
         return None
 
+    # Build auxiliary data for discriminability scoring
+    measurement_cols = [
+        cp.name for cp in col_profiles
+        if cp.role == "continuous_measurement"
+    ]
+    column_roles = {cp.name: cp.role for cp in col_profiles}
+
     best_gc: Optional[GroupingCandidate] = None
     best_semantic_score = -1.0
 
@@ -728,7 +809,11 @@ def _compose_semantic_grouping(
                 [cp.name for cp in purpose_cols[p]] for p in purpose_combo
             ]
             for col_combo in product(*alt_lists):
-                gc = _evaluate_grouping(df, list(col_combo))
+                gc = _evaluate_grouping(
+                    df, list(col_combo),
+                    measurement_cols=measurement_cols,
+                    column_roles=column_roles,
+                )
                 if gc is None:
                     continue
                 # Composite score: semantic weight (integer) + quality (0-1)
@@ -1358,6 +1443,49 @@ def _generate_analysis_contexts(
             use_case="comparison",
         ))
 
+    # Hierarchy-driven contexts: for dimensions in the hierarchy that
+    # aren't already covered by the template-based contexts above.
+    # The hierarchy goes from coarsest to finest. For each adjacent pair,
+    # generate a "drill-down" context: group by the coarser dimension,
+    # compare across the finer dimension.
+    if len(hierarchy) >= 2:
+        _covered_cols = set()
+        for ctx in contexts:
+            _covered_cols.update(ctx.group_by)
+            if ctx.compare_across:
+                _covered_cols.add(ctx.compare_across)
+
+        dim_lookup = {d.name: d for d in dimensions}
+        for i in range(len(hierarchy) - 1):
+            coarse_name = hierarchy[i]
+            fine_name = hierarchy[i + 1]
+            coarse_dim = dim_lookup.get(coarse_name)
+            fine_dim = dim_lookup.get(fine_name)
+            if coarse_dim is None or fine_dim is None:
+                continue
+            coarse_col = coarse_dim.columns[0]
+            fine_col = fine_dim.columns[0]
+            # Only add if this pair isn't already covered
+            pair = {coarse_col, fine_col}
+            if pair <= _covered_cols:
+                continue
+            group_by = [coarse_col, fine_col]
+            n_groups = _count_groups(group_by)
+            if n_groups < 2:
+                continue
+            contexts.append(AnalysisContext(
+                name=f"hierarchy_{coarse_name}_to_{fine_name}",
+                description=(
+                    f"Drill from {coarse_name} into {fine_name} "
+                    f"({coarse_dim.semantic_purpose} → {fine_dim.semantic_purpose})"
+                ),
+                group_by=group_by,
+                compare_across=fine_col,
+                hold_fixed=[coarse_col],
+                expected_groups=n_groups,
+                use_case="drill_down",
+            ))
+
     return contexts
 
 
@@ -1933,6 +2061,37 @@ def profile_dataset(
 
         profile.technique_recommendations = _recommend_techniques(profile)
 
+        # Post-Phase B: Inject bimodal/multimodal analysis contexts.
+        # When a continuous column is bimodal, this is strong evidence of a
+        # latent grouping dimension (e.g. two process modes, two populations).
+        # Generate sub-group exploration contexts for these columns.
+        if dim_structure is not None:
+            bimodal_cols = [
+                col_name for col_name, dp in distributions.items()
+                if dp.n_modes >= 2
+            ]
+            if bimodal_cols:
+                for bc in bimodal_cols[:3]:  # cap at 3 to avoid noise
+                    dp = distributions[bc]
+                    dim_structure.analysis_contexts.append(AnalysisContext(
+                        name=f"subgroup_exploration_{bc}",
+                        description=(
+                            f"{bc} has a {dp.modality} distribution "
+                            f"({dp.n_modes} modes) — investigate whether a "
+                            f"latent categorical split explains the multimodality"
+                        ),
+                        group_by=[c for c in (recommended.columns if recommended else [])],
+                        compare_across=bc,
+                        hold_fixed=[],
+                        expected_groups=dp.n_modes,
+                        use_case="subgroup_exploration",
+                    ))
+                logger.info(
+                    "Phase B: added %d bimodal sub-group exploration context(s) "
+                    "for columns: %s",
+                    len(bimodal_cols[:3]), bimodal_cols[:3],
+                )
+
         logger.info(
             "Schema profiler Phase B: %d/%d columns profiled, "
             "%d technique recommendations",
@@ -2097,6 +2256,9 @@ def build_profile_instructions(profile: DataProfile) -> str:
         lines.append(f"  This produces {rg.group_count} analytical groups "
                       f"(median size: {rg.median_group_size} rows, "
                       f"coverage: {rg.rows_covered_pct}%).")
+        if rg.group_count == 2:
+            lines.append("  NOTE: 2 groups detected — use t-test or pairwise comparison "
+                          "(not ANOVA). Report effect size (Cohen's d) alongside p-value.")
         lines.append(f"  Store per-group results using compound keys joined by '__':")
         lines.append(f"    e.g. \"{compound_example}\"")
         lines.append("  Use a 'per_group' key in analysis_summary.json.")

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from tools import parse_json_tolerant
+from tools import finding_text, parse_json_tolerant
 
 logger = logging.getLogger("report_pipeline")
 
@@ -71,7 +71,7 @@ def _build_research_message(
         domains.append("general biologics characterisation")
 
     domain_str = " and ".join(domains)
-    findings_str = "\n".join(f"- {f}" for f in findings[:10]) if findings else "No specific findings yet."
+    findings_str = "\n".join(f"- {finding_text(f)}" for f in findings[:10]) if findings else "No specific findings yet."
 
     return (
         f"Research the following biologics analytical topic for a scientific report.\n\n"
@@ -1772,7 +1772,7 @@ class ReportPipeline:
         sections.append("## 3. Results\n")
         if findings:
             for i, f in enumerate(findings, 1):
-                sections.append(f"{i}. {f}\n")
+                sections.append(f"{i}. {finding_text(f)}\n")
         else:
             sections.append("No specific findings were recorded.\n")
 

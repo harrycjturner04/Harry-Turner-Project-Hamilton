@@ -143,7 +143,7 @@ python -m vllm.entrypoints.openai.api_server \
   --port "$VLLM_PORT" \
   --host 0.0.0.0 \
   --tensor-parallel-size 1 \
-  --max-model-len 131072 \
+  --max-model-len 262144 \
   --gpu-memory-utilization 0.95 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \

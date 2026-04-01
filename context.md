@@ -188,23 +188,21 @@ pipeline:
 
     - name: analysis
       goals:
-        # Data-structure-aware goals — the planner should adapt methods
-        # based on the schema profiler's dimensional structure and
-        # analysis contexts rather than applying fixed techniques.
-        - Per-group chromatographic or spectral profile characterisation (adapt signal processing to data structure)
-        - Cross-dimensional comparison using the detected hierarchy (e.g. experimental_unit × process_phase)
-        - Peak or mass statistics per analytical group (use recommended grouping from data profile)
-        - System suitability / quality assessment appropriate to the detected domain
-        - Cross-run consistency analysis comparing experimental units
-        - Process-phase trend analysis where stage-level grouping is available
-        - Outlier detection within each analytical group (>2 SD from group mean)
-        - Multi-dimensional heatmap or summary using the full grouping hierarchy
-        - Extended grouping analysis where finer breakdown is available (e.g. per-sample or per-stage subset)
+        # Analytical PRINCIPLES — the planner should translate these into
+        # specific methods and chart types based on the schema profiler's
+        # dimensional structure and analysis contexts.  Do not treat these
+        # as a fixed checklist — adapt to what the data actually contains.
+        - Characterise variation across the detected dimensional hierarchy (e.g. experimental_unit × process_phase × condition)
+        - Identify anomalies at every grouping level using domain-appropriate thresholds
+        - Test for interactions between grouping dimensions (e.g. does column type effect vary by chromatography stage?)
+        - Assess process stability and system suitability using domain-specific metrics and regulatory thresholds
       grouping_guidance: |
         Use the schema profiler's dimensional structure to determine grouping.
         If analysis_contexts are present, use them to select appropriate grouping
         for each analytical question. Do not default to a single flat grouping
         when richer structure is available.
+        Each analytical question should use the most appropriate grouping —
+        different questions may require different grouping strategies.
       quality:
         min_plots: 3
         min_findings: 3
@@ -214,7 +212,8 @@ pipeline:
         prefer: [statistical_analyst, ml_modeler]
         max_agents: 5
         fallback_to_detection: true
-      expert_call_budget: 4
+      max_retries: 5
+      expert_call_budget: 6
 
     - name: cross_validation
       goals:
@@ -232,7 +231,7 @@ pipeline:
   constraints:
     preserve_columns: [run_no, run, chromatography_stage, Sample_Code, column, Fraction_number, charge_state, Spectrum_type]
     no_aggregation_across: [run, run_no]
-    grouping_columns: [run, column]
+    grouping_columns: []
     grouping_extend_when_present: [chromatography_stage, Sample_Code]
 
   run_config:
@@ -247,20 +246,23 @@ pipeline:
     knowledge_base: "chromadb_local"
     research_agent: "deep_research"
     max_groupchat_rounds: 15
+    # WP 1
     schema_profiling: "full"
     iteration_strategy: "convergent"
-    convergence_threshold: 0.05
+    convergence_threshold: 0.02
     convergence_target: 0.85
+    # WP 3
     visual_review_mode: "scientific"
     require_figure_references: true
+    # WP 4
     expert_library: "extended"
     agent_definitions_dir: "agents/"
-    # BS-4: Payload budgets (chars) — tuned for 128K context window.
+    # BS-4: Payload budgets (chars) — tuned for 262K context window.
     # Controls how much of each data source is embedded in report prompts.
     payload_budget_cleaning: 4000           # cleaning summary JSON
-    payload_budget_analysis: 8000           # analysis summary JSON (findings, per_group, etc.)
-    payload_budget_per_file: 3000           # per-file analysis in global captain reports
-    payload_budget_global: 40000            # global report payload JSON (report_pipeline)
+    payload_budget_analysis: 16000           # analysis summary JSON (findings, per_group, etc.)
+    payload_budget_per_file: 6000           # per-file analysis in global captain reports
+    payload_budget_global: 80000            # global report payload JSON (report_pipeline)
     payload_budget_report_excerpt: 10000    # individual report excerpt in cross-file reports
     # WP-C: Critic architecture toggles
     critic_structural: true             # structural gate (pure Python)
@@ -270,7 +272,7 @@ pipeline:
     critic_execution: true              # WP-C3b: execution correctness (pure Python)
     # WP-C2: Targeted refinement
     targeted_refinement: true           # enable PLOT_FIX / FINDING_FIX / GAP_FILL paths
-    refinement_cascade: false           # escalation cascade (enable after validation)
+    refinement_cascade: true           # escalation cascade (enable after validation)
     ml_backend: "tabpfn"                # "sklearn" | "tabpfn" | "both"
 ```
 

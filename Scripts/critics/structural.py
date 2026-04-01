@@ -54,6 +54,7 @@ class StructuralCritic(CriticModule):
         # Grouping adequacy check — analysis stage only
         if ctx.stage_name == "analysis":
             checks.extend(self._check_grouping_adequacy(ctx))
+            checks.extend(self._check_domain_reasoning(ctx))
 
         return checks
 
@@ -96,7 +97,28 @@ class StructuralCritic(CriticModule):
                     f"{dim.get('cardinality', '?')} levels]"
                 )
 
-        if len(missing_dims) >= 2:
+        # ── Check whether secondary_analysis already covers the missing dims ──
+        # If the agent has already added a 'secondary_analysis' key that covers
+        # the missing dimensions, downgrade from MUST_FIX to SHOULD_FIX.
+        secondary_covers = False
+        if missing_dims:
+            import json as _json
+            from pathlib import Path as _Path
+            asp = (ctx.payload or {}).get("analysis_summary_path", "")
+            if asp:
+                try:
+                    _data = _json.loads(_Path(asp).read_text("utf-8"))
+                    _sa = _data.get("secondary_analysis", {})
+                    if isinstance(_sa, dict) and _sa:
+                        _sa_keys = {k.lower() for k in _sa.keys()}
+                        # missing_dims entries: "run [experimental_unit, 11 levels]"
+                        _dim_names = {d.split(" [")[0].lower() for d in missing_dims}
+                        if _dim_names & _sa_keys:
+                            secondary_covers = True
+                except Exception:
+                    pass
+
+        if len(missing_dims) >= 2 and not secondary_covers:
             # 2+ missing important dimensions → MUST_FIX to force secondary
             # analysis context.  The primary grouping key stays as-is; agents
             # must add a secondary analysis covering the missing dimensions.
@@ -120,6 +142,25 @@ class StructuralCritic(CriticModule):
                     "as additional findings that explicitly reference the "
                     "missing dimensions. Use the ANALYSIS CONTEXTS from the "
                     "data profile for guidance."
+                ),
+            ))
+        elif len(missing_dims) >= 2 and secondary_covers:
+            # secondary_analysis covers the missing dimensions — advisory only
+            results.append(CheckResult(
+                name="grouping_adequacy",
+                passed=False,
+                severity=Severity.SHOULD_FIX,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    f"Grouping uses {sorted(used_cols)} but {len(missing_dims)} "
+                    f"meaningful dimensions are not in the primary grouping: "
+                    f"{', '.join(missing_dims)}. Secondary analysis is present "
+                    f"and covers the missing dimensions."
+                ),
+                fix_instruction=(
+                    "The secondary_analysis key covers the missing dimensions. "
+                    "Consider whether the primary grouping should also include "
+                    "these dimensions for completeness."
                 ),
             ))
         elif len(missing_dims) == 1:
@@ -148,6 +189,93 @@ class StructuralCritic(CriticModule):
                 detail=(
                     f"Grouping {sorted(used_cols)} covers the major "
                     f"analytical dimensions."
+                ),
+            ))
+
+        return results
+
+    # ── Domain reasoning structural check ─────────────────────────────
+
+    @staticmethod
+    def _check_domain_reasoning(ctx: CriticContext) -> List[CheckResult]:
+        """Verify analysis_summary.json contains a domain_reasoning field.
+
+        Checks for at least 1 entry in hypotheses_tested or
+        plan_modifications_applied. Lightweight Python check (no LLM).
+        """
+        import json as _json
+
+        results: List[CheckResult] = []
+
+        # Find analysis_summary.json in the payload
+        asp = (ctx.payload or {}).get("analysis_summary_path", "")
+        if not asp:
+            return results
+
+        from pathlib import Path
+        asp_path = Path(asp)
+        if not asp_path.exists():
+            return results
+
+        try:
+            data = _json.loads(asp_path.read_text("utf-8"))
+        except Exception:
+            return results
+
+        dr = data.get("domain_reasoning")
+        if not isinstance(dr, dict):
+            results.append(CheckResult(
+                name="domain_reasoning",
+                passed=False,
+                severity=Severity.MUST_FIX,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    "analysis_summary.json is missing the 'domain_reasoning' "
+                    "field. Expert output must include hypotheses tested, plan "
+                    "modifications, or unexpected observations."
+                ),
+                fix_instruction=(
+                    "Add a 'domain_reasoning' field to analysis_summary.json "
+                    "with at least one entry in 'hypotheses_tested' or "
+                    "'plan_modifications_applied'. Format: "
+                    '{"domain_reasoning": {"hypotheses_tested": [{"hypothesis": '
+                    '"...", "verdict": "supported|refuted|inconclusive", '
+                    '"evidence": "..."}], "plan_modifications_applied": [...], '
+                    '"unexpected_observations": [...]}}'
+                ),
+            ))
+            return results
+
+        hypotheses = dr.get("hypotheses_tested", [])
+        modifications = dr.get("plan_modifications_applied", [])
+        observations = dr.get("unexpected_observations", [])
+        total_entries = len(hypotheses) + len(modifications) + len(observations)
+
+        if total_entries == 0:
+            results.append(CheckResult(
+                name="domain_reasoning",
+                passed=False,
+                severity=Severity.SHOULD_FIX,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    "domain_reasoning field exists but is empty — no hypotheses "
+                    "tested, no plan modifications, and no unexpected observations "
+                    "documented."
+                ),
+                fix_instruction=(
+                    "Populate domain_reasoning with at least one hypothesis "
+                    "tested or one plan modification rationale."
+                ),
+            ))
+        else:
+            results.append(CheckResult(
+                name="domain_reasoning",
+                passed=True,
+                category=CheckCategory.STRUCTURAL,
+                detail=(
+                    f"domain_reasoning present: {len(hypotheses)} hypotheses, "
+                    f"{len(modifications)} modifications, "
+                    f"{len(observations)} observations."
                 ),
             ))
 

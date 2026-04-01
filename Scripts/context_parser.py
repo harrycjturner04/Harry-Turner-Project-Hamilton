@@ -41,8 +41,8 @@ DEFAULT_STAGE_ORDER = ["cleaning", "analysis", "cross_validation", "report"]
 
 DEFAULT_MAX_RETRIES = {
     "cleaning": 2,
-    "analysis": 3,
-    "cross_validation": 1,
+    "analysis": 5,
+    "cross_validation": 2,
     "report": 0,
 }
 
@@ -117,7 +117,7 @@ class RunConfig:
     targeted_refinement: bool = False       # enable finding_fix / gap_fill paths
     refinement_cascade: bool = False        # enable escalation cascade
     ml_backend: str = "sklearn"              # "sklearn"|"tabpfn"|"both" — ML modeler backend
-    max_input_tokens: int = 65_000           # token budget for trim_payload_to_budget
+    max_input_tokens: int = 55_000           # token budget for trim_payload_to_budget
 
     def to_dict(self) -> Dict[str, Any]:
         return _asdict(self)
@@ -178,6 +178,7 @@ class RunPlan:
     domain_override: Optional[str] = None
     run_config: RunConfig = field(default_factory=RunConfig)
     raw_yaml: Dict[str, Any] = field(default_factory=dict)
+    ml_tasks: Dict[str, Any] = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -292,7 +293,7 @@ def _validate_schema(raw: Dict[str, Any]) -> List[str]:
                             )
 
     # Warn about unknown top-level keys
-    known_top = {"pipeline", "constraints", "quality", "run_config"}
+    known_top = {"pipeline", "constraints", "quality", "run_config", "ml_tasks"}
     unknown = set(raw.keys()) - known_top
     if unknown:
         warnings.append(f"Unknown top-level keys (ignored): {sorted(unknown)}")
@@ -567,6 +568,12 @@ def compile_run_plan(
     if not isinstance(run_config_raw, dict):
         run_config_raw = {}
 
+    # ML tasks — from top-level ml_tasks block
+    ml_tasks_raw = yaml_data.get("ml_tasks", {})
+    if not isinstance(ml_tasks_raw, dict):
+        logger.warning("ml_tasks should be a dict, got %s — ignoring", type(ml_tasks_raw).__name__)
+        ml_tasks_raw = {}
+
     return RunPlan(
         project_description=prose_text,
         stages=stages,
@@ -574,6 +581,7 @@ def compile_run_plan(
         domain_override=domain_override,
         run_config=_build_run_config(run_config_raw),
         raw_yaml=yaml_data,
+        ml_tasks=ml_tasks_raw,
     )
 
 

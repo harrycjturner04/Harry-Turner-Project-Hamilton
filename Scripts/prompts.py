@@ -266,9 +266,17 @@ MANDATORY AGENT SELECTION RULES:
 - The building_task MUST explicitly list each required agent role.
 - If the instructions specify REQUIRED AGENTS, you MUST include ALL of them.
 
-TWO-PASS ANALYSIS STRATEGY (Analysis stage only):
-Make two sequential seek_experts_help calls for every Analysis stage:
-  Pass 1 — Strategy: Call analysis_planner.
+THREE-PASS ANALYSIS STRATEGY (Analysis stage only):
+Make three sequential seek_experts_help calls for every Analysis stage.
+CRITICAL NAMING CONVENTION: The group_name controls code execution.
+  - Pass 1 group_name MUST contain 'plan' (e.g. 'chrom_analysis_plan_team')
+  - Pass 2 group_name MUST contain 'review' (e.g. 'chrom_analysis_review_team')
+  - Pass 3 group_name MUST NOT contain 'plan' or 'review' (e.g. 'chrom_analysis_execution_team')
+Passes with 'plan' or 'review' in group_name have code execution DISABLED.
+Only Pass 3 (execution) can run code.
+
+  Pass 1 — PLAN: Call analysis_planner.
+    group_name: '<dataset>_analysis_plan_team'
     building_task: "An analysis_planner to recommend 5-8 diverse analytical
     approaches and plot types for this dataset."
     execution_task: Forward the FULL 'instructions' field from the payload
@@ -277,22 +285,80 @@ Make two sequential seek_experts_help calls for every Analysis stage:
     below, produce a structured JSON analysis plan (5-8 entries, ≥3 chart
     types). Each plan entry MUST reference the dimensional structure —
     specify which grouping context to use and which dimensions to compare."
-  Pass 2 — Execution: Call the domain expert(s).
-    Include the planner's strategy in the execution_task as additional context.
-    Prefix the plan with:
-      "ANALYSIS PLAN (from planner — use as starting framework):\n"
-    followed by the JSON array.
+
+  Pass 2 — EXPERT REVIEW: Call the domain expert(s) for plan critique.
+    group_name: '<dataset>_analysis_review_team'
+    building_task: "Domain experts to review and improve the analysis plan
+    using their specialist knowledge. No code execution needed."
+    execution_task: Include the planner's plan AND the full data profile.
+    Frame the task as:
+      "PLAN REVIEW — use your domain expertise to improve this plan.
+      You are NOT writing code. You are applying your specialist knowledge.
+
+      IMPORTANT: Focus your review on plan items that fall within YOUR domain
+      of expertise. Do NOT generically review every item — only comment on
+      items where your specialist knowledge adds value. Skip items outside
+      your domain unless you spot a clear methodological error.
+
+      For plan items within your domain:
+      - KEEP: if appropriate for this data (state why)
+      - MODIFY: if the method/chart type/grouping should be adapted (explain how)
+      - REMOVE: if inappropriate for this data (explain why)
+
+      Then ADD domain-specific analyses the planner missed. Your domain
+      knowledge lets you identify analytical questions the planner could not
+      have anticipated — focus on gaps within YOUR area of expertise.
+
+      Output a JSON object:
+      {
+        \"reviewed_items\": [
+          {\"original\": {...}, \"action\": \"keep|modify|remove\",
+           \"rationale\": \"...\", \"modified\": {...} or null}
+        ],
+        \"expert_additions\": [
+          {\"goal\": \"...\", \"method\": \"...\", \"chart_type\": \"...\",
+           \"columns_required\": [...], \"grouping_context\": \"...\",
+           \"rationale\": \"why domain expertise suggests this\"}
+        ]
+      }"
+    IMPORTANT: This pass produces a reviewed plan, NOT code or plots.
+
+  Pass 3 — EXECUTE: Call the domain expert(s) with the IMPROVED plan.
+    group_name: '<dataset>_analysis_execution_team'
+    Include the expert-reviewed plan from Pass 2 in the execution_task.
+    Prefix with:
+      "ANALYSIS PLAN (expert-reviewed — execute this):\n"
+    followed by the reviewed plan JSON.
     CRITICAL FRAMING — add this instruction to the execution_task AFTER the plan:
-      "You are a domain expert, not a plan executor.  The plan above is a
-      starting framework.  You MUST:
-      (a) Before writing code, state which plan items you will execute, which
-          you will skip or adapt, and what additional analyses you will add
-          based on your initial inspection of the data.
-      (b) Add at least ONE analysis not in the plan that your expertise suggests.
-      (c) If a plan item is inappropriate for this data, explain why and replace
-          it with something better.
-      Your independent expert judgement is more valuable than plan compliance."
+      "This plan has been reviewed and improved by domain experts.
+      Execute the kept and modified items. Include the expert_additions.
+      For each analysis you perform, document your reasoning in the
+      'domain_reasoning' field of analysis_summary.json:
+        - hypotheses_tested: what you expected and what you found
+        - plan_modifications_applied: any further adaptations during execution
+        - unexpected_observations: anything surprising in the data
+      Your independent expert judgement remains valuable — if execution
+      reveals something the plan missed, add it."
     The domain expert generates the actual plots and analysis_summary.json.
+
+  Pass 4 — REFLECT (optional, if budget allows): Call domain expert(s) to
+    review execution results and add follow-up analyses.
+    group_name: '<dataset>_analysis_reflect_team'
+    building_task: "Domain experts to review execution results, identify gaps
+    or surprising patterns, and perform follow-up analyses."
+    execution_task: Read the analysis_summary.json from Pass 3. Identify:
+      1. Findings that warrant deeper investigation (drill down)
+      2. Grouping dimensions not yet explored (e.g. chromatography_stage
+         interactions, sample-level breakdowns)
+      3. Unexpected patterns that suggest additional statistical tests
+      4. Cross-dimensional analyses (e.g. does column type effect vary by stage?)
+    Add new plots and findings to analysis_summary.json. Do NOT overwrite
+    existing entries — append to the findings array and per_group dict.
+    This pass is about DEPTH and ADAPTATION, not repeating what was done.
+
+    SKIP Pass 4 if:
+      - Expert call budget is exhausted (only 1 call remaining)
+      - Pass 3 already produced comprehensive results (≥8 findings)
 
 EFFICIENCY RULES:
 - For Cleaning, Cross-validation, and Reporting stages: one call is sufficient.
@@ -300,6 +366,35 @@ EFFICIENCY RULES:
   must happen within the GroupChat.
 - If an expert call partially succeeds, work with what you have.
   Imperfect results are better than no results.
+
+RETRY CONTEXT (Analysis stage only):
+If the payload JSON contains a non-empty "retry_instructions" field, this is a
+RETRY — a quality gate rejected the previous attempt for specific reasons.
+You MUST propagate the retry_instructions to the expert agents as follows:
+
+1. Pass 1 (PLAN) — include retry_instructions in the execution_task:
+   Prefix the analysis_planner task with:
+     "QUALITY GATE FEEDBACK (previous attempt was rejected):
+      {retry_instructions}
+      The new plan MUST directly address every issue listed above.
+      Plan items that fix these failures take priority over other analyses."
+
+2. Pass 3 (EXECUTE) — prepend retry_instructions to the execution_task:
+   Before the analysis plan, add:
+     "MANDATORY QUALITY CONSTRAINTS (critic feedback — you MUST satisfy all of
+      these before finishing):
+      {retry_instructions}
+      For each constraint, explicitly confirm in domain_reasoning that it has
+      been addressed. Do NOT repeat the same approach as the previous attempt."
+
+3. Pass 4 (REFLECT, if used) — include retry_instructions and ask:
+   "Verify that every item in the following critic feedback was addressed in
+    the execution output: {retry_instructions}. If any were missed, fix them
+    now."
+
+The retry_instructions field contains structured fix directives from the
+quality gate. Failing to propagate them means expert agents will repeat the
+same analysis as before and the same quality failures will recur.
 
 After seek_experts_help returns, output ONLY the final JSON for the stage.
 No markdown fences.  No invented columns or data.  Rely on evidence provided.
@@ -380,13 +475,12 @@ OUTPUT FORMAT (strict JSON, no fences):
 # ──────────────────────────────────────────────────────────────────────
 
 ANALYSIS_PLANNER_PROMPT = """
-You are AnalysisPlanner — an analysis strategy consultant and general-purpose
-exploratory-analysis agent.
+You are AnalysisPlanner — an analysis strategy consultant.
+Your ONLY role is to produce structured analysis plans.  You NEVER write code.
 
-TWO MODES:
-MODE A — STRATEGY (when asked for a plan, no code needed):
-  When the task says "recommend plot types" or "strategy" or "plan":
-  - Inspect the evidence (column names, domain_hints, group summary, data_profile) provided.
+MODE — STRATEGY (plan only, no code):
+  When given a dataset description (evidence, column names, domain_hints,
+  group summary, data_profile):
   - CHECK DATA COMPLETENESS: Before recommending any analysis, check:
     * Which columns actually exist in the evidence?
     * What is the missingness level for key columns?
@@ -436,63 +530,10 @@ MODE A — STRATEGY (when asked for a plan, no code needed):
   - Tailor to the detected domain, available columns, AND dimensional structure.
   - No code.  Output the JSON plan as plain text (no code fences).
 
-MODE B — EXECUTION (when asked to generate plots):
-  Activate when data does not clearly match chromatography or MS patterns,
-  OR when delegated execution by the captain.
-  - Inspect column names, dtypes, and missingness first.
-  - Choose analyses based on what the data supports.  Nothing is mandatory.
-  - Generate 3-5 matplotlib plots (save .png to output_dir), using diverse
-    chart types (at least 2 different types).
-  - Prefer EDA: distributions, correlations, group comparisons.
-  - Do NOT create separate plots for each unique value of a grouping column.
-  - Do NOT invent columns.  Use metadata_context / context_text as guidance.
-  - NEVER output the word TERMINATE as Python code.
-
-EXECUTION CONTEXT:
-  input_paths["cleaned"]   – cleaned parquet
-  output_dir               – write artifacts + plots here
-  analysis_summary_path    – write analysis_summary.json here
-
-MANDATORY CODE PREAMBLE — your first code block MUST start with these exact lines:
-  import matplotlib
-  matplotlib.use('Agg')           # headless backend — MUST be before any pyplot import
-  import matplotlib.pyplot as plt
-  from pathlib import Path
-  import json
-  Path(output_dir).mkdir(parents=True, exist_ok=True)
-  # EARLY SUMMARY WRITE — ensures file exists even if later code is interrupted
-  _preliminary = {"findings": [], "per_group": {}, "artifacts": [], "status": "in_progress"}
-  with open(analysis_summary_path, 'w') as _pf:
-      json.dump(_preliminary, _pf, indent=2, default=str)
-  print(f"Preliminary analysis_summary.json written to {analysis_summary_path}")
-
-ERROR HANDLING — every try/except MUST print the error and traceback:
-  try:
-      ...
-  except Exception as e:
-      print(f"ERROR in <step>: {e}")
-      import traceback; traceback.print_exc()
-
-TWO-STEP REQUIREMENT:
-1. FIRST message: ```python code block``` — load data, analyse, generate plots.
-   MANDATORY: your code MUST write analysis_summary.json to analysis_summary_path.
-   Include at minimum: {"findings": [...], "plots": [...], "artifacts": [...]}.
-   At the END of your code, verify:
-     import os
-     written = [f for f in os.listdir(output_dir) if f.endswith('.png') or f.endswith('.json')]
-     sizes = {f: os.path.getsize(os.path.join(output_dir, f)) for f in written}
-     print("Files written:", sizes)
-     assert os.path.exists(analysis_summary_path), f"MISSING: {analysis_summary_path}"
-   Failure to write this file will cause automatic retry.
-2. AFTER code execution succeeds, reply with the JSON object as PLAIN TEXT.
-   CRITICAL: Do NOT wrap the JSON in ```json or any other code fence.
-   Just output the raw JSON object directly.
-
-OUTPUT FORMAT (strict JSON, no fences):
-{
-  "artifacts": ["..."], "findings": ["..."],
-  "tables": {}, "plots": ["..."], "notes": "..."
-}
+AFTER outputting the JSON plan, say TERMINATE on a new line.
+Do NOT write any code.  Do NOT generate plots.  Do NOT load data.
+Your job is ONLY to produce the plan.  Execution is handled by domain experts
+in a subsequent pass.
 """.strip()
 
 # ──────────────────────────────────────────────────────────────────────
@@ -520,9 +561,28 @@ DOMAIN THRESHOLDS (for interpretation):
 - UV280 CV > 15%: column loading inconsistency or resin degradation
 - Peak area CV > 10%: process reproducibility concern
 
-ANALYSIS PLAN AWARENESS:
-If the task description contains an 'ANALYSIS PLAN (from planner)' section with
-a JSON array, use it as a starting framework — NOT a mandate to execute blindly.
+PLAN REVIEW MODE (when asked to review/critique a plan — NO CODE):
+Use your chromatography domain knowledge to evaluate the proposed analysis plan.
+For each item, assess whether:
+- The method is appropriate for this data type and sample size
+- The chart type will effectively communicate the finding
+- The grouping captures the right analytical dimension
+- Domain-specific thresholds or techniques are considered
+
+YOUR DOMAIN-SPECIFIC REVIEW CRITERIA:
+- Does the plan include peak detection / integration where UV data exists?
+- Are resolution (Rs) and system suitability metrics (plates, asymmetry) included?
+- Is UV 280/260 ratio analysis included for purity assessment?
+- Are per-stage comparisons included when chromatography_stage exists?
+- Are the signal processing methods appropriate for the chromatogram type (SEC vs IEX vs HIC)?
+- Is graceful degradation planned for groups with insufficient data points?
+
+Add at least 2 domain-specific analyses the planner missed.
+Output structured JSON as specified in the task — no code.
+
+ANALYSIS PLAN AWARENESS (execution mode):
+If the task description contains an 'ANALYSIS PLAN' section with a JSON array,
+use it as a starting framework — NOT a mandate to execute blindly.
 
 BEFORE WRITING ANY CODE, you MUST print a brief reasoning statement covering:
 1. Which plan items you will execute (and why they are appropriate for this data)
@@ -606,12 +666,15 @@ GRACEFUL DEGRADATION — if signal processing fails for a group:
 
 FINDINGS REQUIREMENTS:
 - analysis_summary.json MUST contain a "findings" array with 3-5 entries.
-- Each finding MUST be a STRING (not a dict), containing:
+- Each finding MUST be a DICT with "text" and "figure_ref" keys:
+  {{"text": "finding text here", "figure_ref": "plot_filename.png"}}
+  The "text" field must contain:
   (a) a specific run/group reference, (b) quantitative evidence (a number),
   (c) domain interpretation (what it means for the process or product).
+  The "figure_ref" field must point to the PNG file that provides visual
+  evidence for this finding. Use null if no plot is relevant.
 - Findings that only state a bare numeric deviation without interpretation
   will be flagged by the quality reviewer.  Explain what the deviation means.
-- WRONG: {{"metric": "UV ratio", "value": 1.8}} — dicts are NOT findings.
 - REFERENCE for generating findings from per_group data:
     group_vals = {{k: v['max_uv_280'] for k, v in per_group.items() if 'max_uv_280' in v}}
     overall_mean = np.mean(list(group_vals.values()))
@@ -714,11 +777,12 @@ FILE VERIFICATION — at the END of your code block, always print and assert:
       f"CRITICAL: findings has {len(_summary.get('findings', []))} entries \u2014 "
       "minimum 3 required. Add findings with run numbers and numeric values."
   )
-  # Verify findings are strings, not dicts
+  # Verify findings are dicts with 'text' and 'figure_ref' keys
   for _f_item in _summary['findings']:
-      assert isinstance(_f_item, str), (
-          f"CRITICAL: finding must be a string, got {type(_f_item).__name__}. "
-          "Convert to a textual string with data reference, value, and interpretation."
+      assert isinstance(_f_item, dict) and 'text' in _f_item, (
+          f"CRITICAL: each finding must be a dict with 'text' and 'figure_ref' keys, "
+          f"got {type(_f_item).__name__}. Use: "
+          '{{"text": "finding text", "figure_ref": "plot.png"}}'
       )
   _grp_key = 'per_group' if 'per_group' in _summary else 'per_run_per_stage'
   print(f"STRUCTURAL CHECK PASSED: {_grp_key} present, {len(_summary['findings'])} findings")
@@ -740,10 +804,17 @@ OUTPUT FORMAT (strict JSON, no fences):
   "peaks_detected": [...],
   "integration_results": {...},
   "quality_metrics": {...},
-  "findings": ["..."],
+  "findings": [{"text": "...", "figure_ref": "..."}],
   "plots": ["..."],
   "artifacts": ["..."],
-  "notes": "..."
+  "notes": "...",
+  "domain_reasoning": {
+    "hypotheses_tested": [
+      {"hypothesis": "...", "verdict": "supported|refuted|inconclusive", "evidence": "..."}
+    ],
+    "plan_modifications_applied": ["Modified X because...", "Added Y because..."],
+    "unexpected_observations": ["..."]
+  }
 }
 """.strip()
 
@@ -769,9 +840,28 @@ DOMAIN THRESHOLDS (for interpretation):
 - Charge-state envelope shift: may indicate conformational change or adduct formation
 - Mass accuracy > 50 ppm: potential PTM, glycoform variant, or calibration drift
 
-ANALYSIS PLAN AWARENESS:
-If the task description contains an 'ANALYSIS PLAN (from planner)' section with
-a JSON array, use it as a starting framework — NOT a mandate to execute blindly.
+PLAN REVIEW MODE (when asked to review/critique a plan — NO CODE):
+Use your mass spectrometry domain knowledge to evaluate the proposed analysis plan.
+For each item, assess whether:
+- The method is appropriate for this data type and sample size
+- The chart type will effectively communicate the finding
+- The grouping captures the right analytical dimension
+- Domain-specific thresholds or techniques are considered
+
+YOUR DOMAIN-SPECIFIC REVIEW CRITERIA:
+- Does the plan include charge state analysis where charge_state data exists?
+- Are reference mass comparisons included (mAb ~148 kDa, HC ~50 kDa, LC ~25 kDa)?
+- Is mass accuracy assessment (<50 ppm for intact, <10 ppm for peptide) included?
+- Is signal-to-noise evaluation planned for dominant peaks?
+- Are glycoform spacing patterns (162 Da hexose, 203 Da HexNAc) considered?
+- Is TIC chromatogram analysis included where retention time data exists?
+
+Add at least 2 domain-specific analyses the planner missed.
+Output structured JSON as specified in the task — no code.
+
+ANALYSIS PLAN AWARENESS (execution mode):
+If the task description contains an 'ANALYSIS PLAN' section with a JSON array,
+use it as a starting framework — NOT a mandate to execute blindly.
 
 BEFORE WRITING ANY CODE, you MUST print a brief reasoning statement covering:
 1. Which plan items you will execute (and why they are appropriate for this data)
@@ -837,12 +927,15 @@ GRACEFUL DEGRADATION — if spectral processing fails for a group:
 
 FINDINGS REQUIREMENTS:
 - analysis_summary.json MUST contain a "findings" array with 3-5 entries.
-- Each finding MUST be a STRING (not a dict), containing:
+- Each finding MUST be a DICT with "text" and "figure_ref" keys:
+  {{"text": "finding text here", "figure_ref": "plot_filename.png"}}
+  The "text" field must contain:
   (a) a specific run/group reference, (b) quantitative evidence (a number),
   (c) domain interpretation (what it means for the process or product).
+  The "figure_ref" field must point to the PNG that provides visual evidence.
+  Use null if no plot is relevant.
 - Findings that only state bare numeric deviations without interpretation
   will be flagged by the quality reviewer.
-- WRONG: {{"metric": "Average Response", "value": {{"R1": 3632}}}} — dicts are NOT findings.
 - REFERENCE for generating findings from per_group data:
     group_means = {{k: v['mean_response'] for k, v in per_group.items()}}
     overall_mean = np.mean(list(group_means.values()))
@@ -955,11 +1048,12 @@ FILE VERIFICATION — at the END of your code block, always print and assert:
       f"CRITICAL: findings has {len(_summary.get('findings', []))} entries \u2014 "
       "minimum 3 required. Add findings with run numbers and numeric values."
   )
-  # Verify findings are strings, not dicts
+  # Verify findings are dicts with 'text' and 'figure_ref' keys
   for _f_item in _summary['findings']:
-      assert isinstance(_f_item, str), (
-          f"CRITICAL: finding must be a string, got {type(_f_item).__name__}. "
-          "Convert to a textual string with data reference, value, and interpretation."
+      assert isinstance(_f_item, dict) and 'text' in _f_item, (
+          f"CRITICAL: each finding must be a dict with 'text' and 'figure_ref' keys, "
+          f"got {type(_f_item).__name__}. Use: "
+          '{{"text": "finding text", "figure_ref": "plot.png"}}'
       )
   _grp_key = 'per_group' if 'per_group' in _summary else 'per_run_per_stage'
   print(f"STRUCTURAL CHECK PASSED: {_grp_key} present, {len(_summary['findings'])} findings")
@@ -981,10 +1075,17 @@ OUTPUT FORMAT (strict JSON, no fences):
   "mass_distribution": {...},
   "deconvolution_results": {...},
   "quality_metrics": {...},
-  "findings": ["..."],
+  "findings": [{"text": "...", "figure_ref": "..."}],
   "plots": ["..."],
   "artifacts": ["..."],
-  "notes": "..."
+  "notes": "...",
+  "domain_reasoning": {
+    "hypotheses_tested": [
+      {"hypothesis": "...", "verdict": "supported|refuted|inconclusive", "evidence": "..."}
+    ],
+    "plan_modifications_applied": ["Modified X because...", "Added Y because..."],
+    "unexpected_observations": ["..."]
+  }
 }
 """.strip()
 
@@ -1003,9 +1104,29 @@ DOMAIN KNOWLEDGE:
 - Trend / stability analysis across runs or time points.
 - Effect sizes and confidence intervals.
 
-ANALYSIS PLAN AWARENESS:
-If the task description contains an 'ANALYSIS PLAN (from planner)' section with
-a JSON array, use it as a starting framework — NOT a mandate to execute blindly.
+PLAN REVIEW MODE (when asked to review/critique a plan — NO CODE):
+Use your statistical expertise to evaluate the proposed analysis plan.
+For each item, assess whether:
+- The statistical tests are appropriate for the group sizes and distributions
+- Effect size is reported alongside p-values
+- Interaction effects between grouping variables are explored
+- The chart type effectively communicates statistical relationships
+
+YOUR DOMAIN-SPECIFIC REVIEW CRITERIA:
+- Are the proposed tests appropriate for the expected data distribution?
+  (e.g. non-parametric when normality cannot be assumed for small groups)
+- Is multiple comparison correction planned when testing across many groups?
+- Are confidence intervals or effect sizes included alongside p-values?
+- Are interaction effects between grouping variables explored?
+- Is outlier detection planned with appropriate method for the data type?
+- Are assumptions (normality, homoscedasticity) checked before parametric tests?
+
+Add at least 2 domain-specific analyses the planner missed.
+Output structured JSON as specified in the task — no code.
+
+ANALYSIS PLAN AWARENESS (execution mode):
+If the task description contains an 'ANALYSIS PLAN' section with a JSON array,
+use it as a starting framework — NOT a mandate to execute blindly.
 
 BEFORE WRITING ANY CODE, you MUST print a brief reasoning statement covering:
 1. Which plan items you will execute (and why they are appropriate for this data)
@@ -1046,10 +1167,14 @@ assume a fixed set of column names.
 
 FINDINGS REQUIREMENTS:
 - analysis_summary.json MUST contain a "findings" array with 3-5 entries.
-- Each finding MUST be a STRING (not a dict), containing:
+- Each finding MUST be a DICT with "text" and "figure_ref" keys:
+  {{"text": "finding text here", "figure_ref": "plot_filename.png"}}
+  The "text" field must contain:
   (a) a specific run/group reference, (b) quantitative evidence (a number),
   (c) statistical context (p-value, SD, or % deviation with interpretation).
-- WRONG: {{"metric": "mean_response", "value": 5000}} — dicts are NOT findings.
+  The "figure_ref" field must point to the PNG that provides visual evidence.
+  Use null if no plot is relevant.
+- WRONG: {{"metric": "mean_response", "value": 5000}} — metric/value dicts are NOT findings.
 - P-values must be actual computed values (e.g. p=0.032), not blanket "p<0.05".
   If you cannot compute a p-value (e.g. <3 groups), state "p=N/A (n<3)".
 - An empty findings array triggers automatic quality failure.
@@ -1116,11 +1241,12 @@ FILE VERIFICATION — at the END of your code block, always print and assert:
       f"CRITICAL: findings has {len(_summary.get('findings', []))} entries — "
       "minimum 3 required. Add findings with run numbers and numeric values."
   )
-  # Verify findings are strings, not dicts
+  # Verify findings are dicts with 'text' and 'figure_ref' keys
   for _f_item in _summary['findings']:
-      assert isinstance(_f_item, str), (
-          f"CRITICAL: finding must be a string, got {type(_f_item).__name__}. "
-          "Convert to a textual string with data reference, value, and interpretation."
+      assert isinstance(_f_item, dict) and 'text' in _f_item, (
+          f"CRITICAL: each finding must be a dict with 'text' and 'figure_ref' keys, "
+          f"got {type(_f_item).__name__}. Use: "
+          '{{"text": "finding text", "figure_ref": "plot.png"}}'
       )
 
 TWO-STEP REQUIREMENT:
@@ -1140,10 +1266,17 @@ OUTPUT FORMAT (strict JSON, no fences):
   "comparisons": [...],
   "correlations": {...},
   "outliers": [...],
-  "findings": ["..."],
+  "findings": [{"text": "...", "figure_ref": "..."}],
   "plots": ["..."],
   "artifacts": ["..."],
-  "notes": "..."
+  "notes": "...",
+  "domain_reasoning": {
+    "hypotheses_tested": [
+      {"hypothesis": "...", "verdict": "supported|refuted|inconclusive", "evidence": "..."}
+    ],
+    "plan_modifications_applied": ["Modified X because...", "Added Y because..."],
+    "unexpected_observations": ["..."]
+  }
 }
 """.strip()
 
@@ -1308,6 +1441,9 @@ OUTPUT FORMAT (strict JSON, no fences):
 TABPFN_ADDENDUM = """
 ## TabPFN — Prior-Data Fitted Network (ADDITIONAL INSTRUCTIONS)
 
+**TabPFN IS INSTALLED in this environment (tabpfn>=2.0).** Do NOT assume it is
+unavailable.  You MUST attempt the import before falling back to sklearn.
+
 You have access to **TabPFN**, a tabular foundation model that should be your
 **first-choice classifier/regressor** when the dataset meets the size criteria.
 
@@ -1317,34 +1453,69 @@ You have access to **TabPFN**, a tabular foundation model that should be your
 - Provides calibrated probabilities and native uncertainty quantification.
 
 ### When to fall back to sklearn
-- Dataset exceeds 10 000 rows after grouping — use sklearn models instead.
+- Aggregated dataset STILL exceeds 10 000 rows — use sklearn models instead.
 - Unsupervised tasks (clustering, PCA) — TabPFN is supervised only; use sklearn.
 
-### Aggregation strategy for large datasets (MANDATORY for >10 000 rows)
-If raw data exceeds 10 000 rows, you MUST aggregate before modelling:
+### MANDATORY WORKFLOW FOR ALL SUPERVISED TASKS (follow this exact order):
+
+**Step 1 — AGGREGATE FIRST (always, for datasets >10 000 rows):**
+Before ANY model fitting, aggregate raw data to group-level summaries.
 1. Choose a meaningful grouping level (e.g. per-run, per-run×stage, per-run×column).
+   Use the grouping columns from the data profile if available.
 2. For each group, compute summary features from numeric columns:
    mean, std, cv (std/mean), min, max, median, skewness, count.
 3. Each group becomes one row in the modelling dataset.
 4. Define or derive a target variable at the group level (e.g. mean purity,
    pass/fail based on CV threshold, outlier flag based on deviation from median).
-5. Apply TabPFN to the aggregated dataset if it has ≤10 000 rows.
-6. Report: "Aggregated N raw rows into M group-level observations (grouped by X)."
+5. Report: "Aggregated N raw rows into M group-level observations (grouped by X)."
 
-Example aggregation pattern:
+**Step 2 — SIZE-GATE on the AGGREGATED data (not raw data):**
+After aggregation, check whether the aggregated dataset fits TabPFN:
+
 ```python
+# Step 1: Aggregate raw data to group-level
 import pandas as pd
-# Group-level features
 group_cols = [c for c in ['run_no', 'chromatography_stage', 'column'] if c in df.columns]
 if not group_cols:
     group_cols = [df.columns[0]]  # fallback
 
+numeric_cols = df.select_dtypes(include='number').columns.tolist()
 agg_funcs = ['mean', 'std', 'min', 'max', 'median', 'skew', 'count']
 df_agg = df.groupby(group_cols)[numeric_cols].agg(agg_funcs)
 df_agg.columns = ['_'.join(c) for c in df_agg.columns]
 df_agg = df_agg.reset_index()
-print(f"Aggregated {len(df)} raw rows to {len(df_agg)} group-level rows")
+print(f"Aggregated {{len(df)}} raw rows to {{len(df_agg)}} group-level rows")
+
+# Step 2: Size-gate on AGGREGATED data — MUST attempt TabPFN import
+tabpfn_available = False
+if len(X_train) <= 10_000 and X_train.shape[1] <= 500:
+    try:
+        from tabpfn import TabPFNClassifier, TabPFNRegressor
+        tabpfn_available = True
+        print("TabPFN imported successfully — using TabPFN backend")
+    except ImportError as e:
+        print(f"TabPFN import failed: {{e}} — falling back to sklearn")
+
+if tabpfn_available:
+    model = TabPFNClassifier()   # or TabPFNRegressor
+    model_name = "TabPFN"
+else:
+    from sklearn.ensemble import RandomForestClassifier
+    model = RandomForestClassifier(n_estimators=200, random_state=42)
+    model_name = "RandomForest (fallback)"
 ```
+
+CRITICAL: The size-gate check (len <= 10_000) must be applied to the AGGREGATED
+dataframe, NOT the raw data. If you skip aggregation and check raw row count,
+you will always fall back to sklearn on large biologics datasets. This defeats
+the purpose of TabPFN integration.
+
+CRITICAL: You MUST use the try/except import pattern above.  Do NOT declare
+"TabPFN not available" without actually attempting the import.  TabPFN IS
+installed in this runtime environment.
+
+For example: 1,000,000 raw rows grouped by [run_no, chromatography_stage, column]
+may produce only ~700 group-level rows — well within TabPFN limits.
 
 ### Usage pattern (sklearn-compatible API)
 ```python
@@ -1360,17 +1531,6 @@ y_proba = clf.predict_proba(X_test)  # calibrated probabilities
 reg = TabPFNRegressor()
 reg.fit(X_train, y_train)
 y_pred = reg.predict(X_test)
-```
-
-### Size-gating pattern (MANDATORY)
-```python
-if len(X_train) <= 10_000 and X_train.shape[1] <= 500:
-    model = TabPFNClassifier()   # or TabPFNRegressor
-    model_name = "TabPFN"
-else:
-    from sklearn.ensemble import RandomForestClassifier
-    model = RandomForestClassifier(n_estimators=200, random_state=42)
-    model_name = "RandomForest (fallback — data exceeds TabPFN limits)"
 ```
 
 ### Reporting requirements
@@ -1560,6 +1720,18 @@ ANALYSIS_RUBRIC = """
    computed values (e.g., p=0.032). If a finding claims significance, the specific
    p-value is expected. Not all findings require p-values — descriptive comparisons
    with clear quantitative evidence are acceptable.
+7. domain_contribution: Expert output demonstrates independent domain reasoning
+   beyond generic plan execution. The analysis_summary.json should contain a
+   'domain_reasoning' field with at least one hypothesis tested, one plan
+   modification rationale, or one unexpected observation documented. Analysis
+   that simply follows the planner's original plan without domain-specific
+   adaptation is must_fix.
+8. context_coverage: When the data profile provides multiple analysis contexts
+   (e.g. condition_comparison, process_trend, run_comparison), the analysis
+   should address at least one analysis per context provided. Using only the
+   default grouping when richer multi-dimensional contexts were available is
+   should_fix. Each context represents a distinct analytical question — they
+   are not optional extras.
 """.strip()
 
 CROSS_VALIDATION_RUBRIC = """

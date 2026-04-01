@@ -22,6 +22,7 @@ from tools import (
     CheckResult,
     Severity,
     detect_data_domains,
+    finding_text,
     parse_json_tolerant,
     safe_write_json,
     strip_think_tokens,
@@ -105,6 +106,12 @@ class AnalyticalDepthCritic(CriticModule):
 
         # 0. Grouping adequacy (are the key dimensions covered?)
         checks.extend(self._check_grouping_adequacy(summary, ctx))
+
+        # 0b. Grouping compliance (do per_group keys match recommended grouping?)
+        checks.extend(self._check_grouping_compliance(summary, ctx))
+
+        # 0c. Multi-context coverage (were provided analysis contexts used?)
+        checks.extend(self._check_context_coverage(summary, ctx))
 
         # 1. Missing group comparison
         checks.extend(self._check_group_comparison(findings, per_group))
@@ -259,15 +266,246 @@ class AnalyticalDepthCritic(CriticModule):
             ),
         )]
 
+    def _check_grouping_compliance(
+        self, summary: Dict[str, Any], ctx: CriticContext,
+    ) -> List[CheckResult]:
+        """Verify per_group keys match (or are finer-grained than) recommended grouping.
+
+        Loads the data_profile.json and checks whether the per_group key
+        structure in the analysis output contains the recommended grouping
+        column values.  A mismatch (e.g. agent grouped by a different
+        column entirely) is MUST_FIX; a coarser grouping (missing one
+        recommended column) is SHOULD_FIX.
+        """
+        asp = ctx.payload.get("analysis_summary_path", "")
+        if not asp:
+            return []
+        profile_path = Path(asp).parent / "data_profile.json"
+        if not profile_path.exists():
+            return []
+
+        try:
+            profile_data = json.loads(profile_path.read_text("utf-8"))
+        except Exception:
+            return []
+
+        rec_grp = profile_data.get("recommended_grouping")
+        if not isinstance(rec_grp, dict) or not rec_grp.get("columns"):
+            return []
+        rec_cols = rec_grp["columns"]
+
+        per_group = summary.get("per_group", summary.get("per_run_per_stage", {}))
+        if not isinstance(per_group, dict) or not per_group:
+            return []
+
+        # Heuristic: check if the per_group keys contain substrings matching
+        # the known group values for each recommended column.
+        # Look up sample values from the profile's dimensional structure.
+        dim_struct = profile_data.get("dimensional_structure", {})
+        dims_by_col: Dict[str, List[str]] = {}
+        for dim in dim_struct.get("dimensions", []):
+            for col in dim.get("columns", []):
+                vals = [str(v) for v in dim.get("sample_values", [])]
+                if vals:
+                    dims_by_col[col] = vals
+
+        # Check a sample of per_group keys for presence of recommended column values
+        sample_keys = list(per_group.keys())[:20]
+        keys_text = " ".join(sample_keys).lower()
+
+        covered_cols = []
+        missing_cols = []
+        for col in rec_cols:
+            sample_vals = dims_by_col.get(col, [])
+            if sample_vals:
+                # Check if any sample value appears in the per_group keys
+                found = any(str(v).lower() in keys_text for v in sample_vals[:5])
+                if found:
+                    covered_cols.append(col)
+                else:
+                    missing_cols.append(col)
+            else:
+                # No sample values to check — assume covered
+                covered_cols.append(col)
+
+        if not missing_cols:
+            return [CheckResult(
+                name="depth__grouping_compliance",
+                passed=True,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=(
+                    f"per_group keys match recommended grouping: "
+                    f"{', '.join(rec_cols)}"
+                ),
+            )]
+
+        # All recommended columns missing → agent used completely wrong grouping
+        if len(missing_cols) == len(rec_cols):
+            return [CheckResult(
+                name="depth__grouping_mismatch",
+                passed=False,
+                severity=Severity.MUST_FIX,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=(
+                    f"per_group keys do not contain values from recommended "
+                    f"grouping columns {rec_cols}. The agent appears to have "
+                    f"used a different grouping than recommended by the profiler."
+                ),
+                fix_instruction=(
+                    f"Regroup analysis using the compound key: "
+                    f"({', '.join(rec_cols)}). Use '__' to join values in "
+                    f"per_group keys. The data profile specifies this grouping."
+                ),
+            )]
+
+        # Partial mismatch — coarser than recommended
+        return [CheckResult(
+            name="depth__grouping_partial_mismatch",
+            passed=False,
+            severity=Severity.SHOULD_FIX,
+            category=CheckCategory.CONTENT_QUALITY,
+            detail=(
+                f"per_group keys cover {covered_cols} but miss "
+                f"{missing_cols} from the recommended grouping."
+            ),
+            fix_instruction=(
+                f"The recommended grouping is ({', '.join(rec_cols)}). "
+                f"Include {', '.join(missing_cols)} in your compound grouping "
+                f"key for finer-grained analysis."
+            ),
+        )]
+
+    def _check_context_coverage(
+        self, summary: Dict[str, Any], ctx: CriticContext,
+    ) -> List[CheckResult]:
+        """Flag when multiple analysis contexts were provided but only one used.
+
+        Checks findings + secondary_analysis for references to context-specific
+        column names. When N contexts exist but fewer than max(2, N-1) are
+        referenced, flags as SHOULD_FIX.
+        """
+        asp = ctx.payload.get("analysis_summary_path", "")
+        if not asp:
+            return []
+        profile_path = Path(asp).parent / "data_profile.json"
+        if not profile_path.exists():
+            return []
+
+        try:
+            profile_data = json.loads(profile_path.read_text("utf-8"))
+        except Exception:
+            return []
+
+        dim_struct = profile_data.get("dimensional_structure", {})
+        contexts = dim_struct.get("analysis_contexts", [])
+        if len(contexts) < 2:
+            return []  # nothing to check with 0-1 contexts
+
+        # Split into meaningful vs hierarchy drill-down contexts.
+        # Hierarchy contexts (name starts with "hierarchy_") are auto-generated
+        # adjacency pairs from the schema profiler and represent data-structural
+        # relationships rather than analytical questions — they are not enforced.
+        meaningful_contexts = [
+            c for c in contexts if not c.get("name", "").startswith("hierarchy_")
+        ]
+        if len(meaningful_contexts) < 2:
+            return []  # not enough meaningful contexts to enforce coverage
+
+        # Build text corpus from findings + secondary_analysis
+        findings = summary.get("findings", [])
+        findings_text = " ".join(finding_text(f) for f in findings).lower()
+        sa = summary.get("secondary_analysis", {})
+        if isinstance(sa, dict):
+            sa_text = json.dumps(sa, default=str).lower()
+        else:
+            sa_text = ""
+        corpus = findings_text + " " + sa_text
+
+        # Check which meaningful contexts are referenced
+        used_contexts = []
+        unused_contexts = []
+        for ac in meaningful_contexts:
+            compare_col = ac.get("compare_across", "")
+            group_cols = ac.get("group_by", [])
+            name = ac.get("name", "")
+            found = (
+                compare_col.lower() in corpus
+                or name.lower().replace("_", " ") in corpus
+                or any(c.lower() in corpus for c in group_cols)
+            )
+            if found:
+                used_contexts.append(name)
+            else:
+                unused_contexts.append(name)
+
+        min_expected = max(2, len(meaningful_contexts) - 1)
+        if len(used_contexts) >= min_expected:
+            return [CheckResult(
+                name="depth__context_coverage",
+                passed=True,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=(
+                    f"{len(used_contexts)}/{len(meaningful_contexts)} meaningful "
+                    f"analysis contexts addressed: {', '.join(used_contexts)}"
+                ),
+            )]
+
+        return [CheckResult(
+            name="depth__low_context_coverage",
+            passed=False,
+            severity=Severity.SHOULD_FIX,
+            category=CheckCategory.CONTENT_QUALITY,
+            detail=(
+                f"Only {len(used_contexts)}/{len(meaningful_contexts)} meaningful "
+                f"analysis contexts addressed. Unused: {', '.join(unused_contexts)}."
+            ),
+            fix_instruction=(
+                f"The data profile provides {len(meaningful_contexts)} analytical "
+                f"contexts: {', '.join(ac.get('name', '?') for ac in meaningful_contexts)}. "
+                f"Address at least {min_expected} — add findings or secondary "
+                f"analysis for: {', '.join(unused_contexts)}."
+            ),
+        )]
+
     def _check_group_comparison(
         self, findings: List[str], per_group: Dict[str, Any],
     ) -> List[CheckResult]:
-        """Flag if ≥3 groups but no ANOVA/Kruskal-Wallis in findings."""
+        """Flag if ≥2 groups but no statistical comparison in findings."""
         n_groups = len(per_group)
-        if n_groups < 3:
+        if n_groups < 2:
             return []
 
-        findings_text = " ".join(str(f) for f in findings).lower()
+        findings_text = " ".join(finding_text(f) for f in findings).lower()
+
+        if n_groups == 2:
+            # Binary design: expect t-test or pairwise comparison
+            has_comparison = any(
+                kw in findings_text
+                for kw in ("t-test", "t_test", "ttest", "mann-whitney", "wilcoxon",
+                            "cohen", "effect size", "p-value", "p_value",
+                            "pairwise", "between groups", "compared to")
+            )
+            if has_comparison:
+                return [CheckResult(
+                    name="depth__group_comparison",
+                    passed=True,
+                    category=CheckCategory.CONTENT_QUALITY,
+                    detail=f"Pairwise comparison present for {n_groups} groups",
+                )]
+            return [CheckResult(
+                name="depth__missing_group_comparison",
+                passed=False,
+                severity=Severity.MUST_FIX,
+                category=CheckCategory.CONTENT_QUALITY,
+                detail=f"{n_groups} groups present but no t-test or pairwise comparison performed",
+                fix_instruction=(
+                    "Add a pairwise comparison (scipy.stats.ttest_ind for normal data, "
+                    "scipy.stats.mannwhitneyu otherwise). Report p-value and effect size "
+                    "(Cohen's d). Store results in analysis_summary.json."
+                ),
+            )]
+
+        # 3+ groups: expect ANOVA or Kruskal-Wallis
         has_comparison = any(
             kw in findings_text
             for kw in ("anova", "kruskal", "f-test", "f_oneway", "p-value", "p_value",
@@ -361,8 +599,9 @@ class AnalyticalDepthCritic(CriticModule):
         # ── Fallback: lightweight heuristic (less strict than keyword matching) ──
         bare_count = 0
         for f in findings:
-            f_lower = str(f).lower()
-            has_number = bool(re.search(r'\d+\.?\d*%', str(f)))
+            ft = finding_text(f)
+            f_lower = ft.lower()
+            has_number = bool(re.search(r'\d+\.?\d*%', ft))
             # Check for ANY explanatory language, not just vocabulary tokens
             has_interpretation = (
                 any(word in f_lower for word in _INTERPRETATION_VOCABULARY)
@@ -430,7 +669,7 @@ class AnalyticalDepthCritic(CriticModule):
             "Return JSON: {\"bare_count\": N, \"total\": N, \"detail\": \"...\"}\n"
             "No code fences."
         )
-        findings_text = "\n".join(f"  {i+1}. {f}" for i, f in enumerate(findings[:8]))
+        findings_text = "\n".join(f"  {i+1}. {finding_text(f)}" for i, f in enumerate(findings[:8]))
         try:
             response = self._pipeline._critic_client.chat.completions.create(
                 model=self._pipeline._critic_model,
@@ -548,7 +787,7 @@ class AnalyticalDepthCritic(CriticModule):
         if len(per_group) < 3:
             return []
 
-        findings_text = " ".join(str(f) for f in findings).lower()
+        findings_text = " ".join(finding_text(f) for f in findings).lower()
         has_outlier = any(
             kw in findings_text
             for kw in ("outlier", "z-score", "iqr", "interquartile", "extreme",
@@ -653,7 +892,7 @@ class AnalyticalDepthCritic(CriticModule):
         if len(per_group) < 4:
             return []
 
-        findings_text = " ".join(str(f) for f in findings).lower()
+        findings_text = " ".join(finding_text(f) for f in findings).lower()
         _interaction_keywords = (
             "interaction", "cross-group", "between groups",
             "group x", "two-way", "factorial", "moderation",
@@ -706,7 +945,7 @@ class AnalyticalDepthCritic(CriticModule):
 
         input_text = (
             f"Findings ({len(findings)} total):\n"
-            + "\n".join(f"  - {f}" for f in findings[:8])
+            + "\n".join(f"  - {finding_text(f)}" for f in findings[:8])
             + f"\n\nGroups: {len(per_group)}"
             + f"\nGroup names (sample): {list(per_group.keys())[:5]}"
         )

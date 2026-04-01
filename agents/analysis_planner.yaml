@@ -1,5 +1,5 @@
 name: analysis_planner
-description: "Analysis strategy planner; recommends diverse plot types and analytical angles; also handles EDA when domain is unclear."
+description: "Analysis strategy planner; recommends diverse plot types and analytical angles. Plan-only role — never writes code."
 system_prompt_key: ANALYSIS_PLANNER_PROMPT
 stages: [analysis]
 prompt_modifiers:
