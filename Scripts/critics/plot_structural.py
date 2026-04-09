@@ -126,7 +126,26 @@ class PlotStructuralCritic(CriticModule):
                 # 3. Extreme aspect ratio
                 if dims[0] > 0 and dims[1] > 0:
                     ratio = max(dims) / min(dims)
-                    if ratio > 4.0:
+                    if ratio > 20.0:
+                        # Physically unusable — MUST_FIX
+                        checks.append(CheckResult(
+                            name=f"plot_struct__extreme_aspect",
+                            passed=False,
+                            severity=Severity.MUST_FIX,
+                            category=CheckCategory.PLOT_QUALITY,
+                            detail=(
+                                f"'{fname}' has extreme aspect ratio {ratio:.1f}:1 "
+                                f"({width}x{height}) — physically unreadable"
+                            ),
+                            fix_instruction=(
+                                f"Regenerate '{fname}' with a balanced aspect ratio. "
+                                "Use figsize=(12, 6) or similar. If many subplots are "
+                                "needed, split into multiple figures rather than stacking "
+                                "all in one tall figure. Aim for 1:1 to 2:1 (width:height)."
+                            ),
+                            ref=fname,
+                        ))
+                    elif ratio > 4.0:
                         checks.append(CheckResult(
                             name=f"plot_struct__extreme_aspect",
                             passed=False,

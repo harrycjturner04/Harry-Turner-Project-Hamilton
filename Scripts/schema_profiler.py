@@ -40,9 +40,9 @@ _METADATA_TEXT_MIN_MEDIAN_LEN = 20  # median string length above this → metada
 
 # Grouping inference
 _MIN_GROUPS = 2                     # minimum useful group count (2 = binary/pairwise designs)
-_MAX_GROUPS = 200                   # maximum before grouping becomes unwieldy
+_MAX_GROUPS = 500                   # maximum before grouping becomes unwieldy
 _MIN_ROWS_PER_GROUP = 5             # each group should have at least this many rows
-_IDEAL_GROUP_RANGE = (5, 100)       # preferred range for group count scoring
+_IDEAL_GROUP_RANGE = (5, 200)       # preferred range for group count scoring
 _MAX_GROUPING_COMBO_COLUMNS = 3     # max columns in a compound grouping key
 _CANDIDATE_NULL_CEILING = 0.8       # columns below this null% are eligible as grouping candidates
 _COVERAGE_PENALTY_WEIGHT = 0.15     # score penalty weight for partial-coverage grouping columns
@@ -491,11 +491,12 @@ def _score_grouping(
     *,
     discriminability: float = 0.0,
     has_ordinal: bool = False,
+    n_columns: int = 1,
 ) -> float:
     """Score a candidate grouping on a 0-1 scale.
 
     Higher = better. Considers:
-    - group_count in ideal range (2-100)
+    - group_count in ideal range (2-200)
     - minimum group size (>= _MIN_ROWS_PER_GROUP)
     - discriminability: CV of measurement means across groups (high = good —
       the grouping separates the data along a dimension with meaningful
@@ -505,10 +506,13 @@ def _score_grouping(
     - ordinal bonus: groupings containing ordinal stages receive a 0.15
       bonus (capped at 1.0) because ordinal dimensions typically encode
       process phases with analytically meaningful progression.
+    - dimensionality bonus: multi-column groupings receive +0.10 per
+      additional column beyond 1 (capped at +0.30 for 4+ columns),
+      rewarding deeper analytical slicing.
     """
     score = 0.0
 
-    # Group count score (0-0.35): prefer 5-100 groups, accept down to 2
+    # Group count score (0-0.35): prefer 5-200 groups, accept down to 2
     if _IDEAL_GROUP_RANGE[0] <= group_count <= _IDEAL_GROUP_RANGE[1]:
         score += 0.35
     elif _MIN_GROUPS <= group_count <= _MAX_GROUPS:
@@ -548,6 +552,12 @@ def _score_grouping(
     # stages E1→E2→W1→W2). Boost these groupings.
     if has_ordinal:
         score += 0.15
+
+    # Dimensionality bonus: multi-column groupings capture richer
+    # analytical structure.  +0.10 per column beyond the first,
+    # capped at +0.30 (i.e. full bonus at 4+ columns).
+    if n_columns > 1:
+        score += min(0.10 * (n_columns - 1), 0.30)
 
     return round(min(score, 1.0), 4)
 
@@ -638,6 +648,7 @@ def _evaluate_grouping(
         group_count, min_size, median_size, cv, rows_covered_pct,
         discriminability=discriminability,
         has_ordinal=has_ordinal,
+        n_columns=len(columns),
     )
 
     # Apply coverage penalty for partial-null grouping columns so that
@@ -816,8 +827,11 @@ def _compose_semantic_grouping(
                 )
                 if gc is None:
                     continue
-                # Composite score: semantic weight (integer) + quality (0-1)
-                composite = semantic_weight + gc.score
+                # Composite score: amplified semantic weight + quality (0-1).
+                # The 1.5× multiplier ensures that analytically richer
+                # groupings (more purposes) can outscore statistically
+                # cleaner but shallower alternatives.
+                composite = semantic_weight * 1.5 + gc.score
                 if composite > best_semantic_score:
                     best_semantic_score = composite
                     best_gc = gc
@@ -1484,6 +1498,59 @@ def _generate_analysis_contexts(
                 hold_fixed=[coarse_col],
                 expected_groups=n_groups,
                 use_case="drill_down",
+            ))
+
+    # Context 6: Interaction analysis — cross 3+ dimensions to detect
+    # interaction effects (e.g. does column effect vary by stage?).
+    # Combines unit × condition × phase when all three are available.
+    if units and conditions and phases:
+        unit_col = units[0].columns[0]
+        cond_col = conditions[0].columns[0]
+        phase_col = phases[0].columns[0]
+        group_by = [unit_col, cond_col, phase_col]
+        n_groups = _count_groups(group_by)
+        if n_groups >= _MIN_GROUPS:
+            contexts.append(AnalysisContext(
+                name="interaction_analysis",
+                description=(
+                    f"Detect interaction effects between {conditions[0].name} "
+                    f"and {phases[0].name} within each {units[0].name}"
+                ),
+                group_by=group_by,
+                compare_across=cond_col,
+                hold_fixed=[unit_col, phase_col],
+                expected_groups=n_groups,
+                use_case="interaction",
+            ))
+
+    # Context 7: Deep process trend — full hierarchy including replicates
+    # when available (unit × condition × phase × replicate).
+    if phases and replicates and (units or conditions):
+        rep_col = replicates[0].columns[0]
+        outer: List[str] = []
+        hold_deep: List[str] = []
+        if units:
+            outer.append(units[0].columns[0])
+            hold_deep.append(units[0].columns[0])
+        if conditions:
+            outer.append(conditions[0].columns[0])
+            hold_deep.append(conditions[0].columns[0])
+        phase_col = phases[0].columns[0]
+        group_by = outer + [phase_col, rep_col]
+        n_groups = _count_groups(group_by)
+        if n_groups >= _MIN_GROUPS:
+            contexts.append(AnalysisContext(
+                name="deep_process_trend",
+                description=(
+                    f"Full-depth process trend: {phases[0].name} progression "
+                    f"with {replicates[0].name} granularity"
+                    + (f" within {' × '.join(hold_deep)}" if hold_deep else "")
+                ),
+                group_by=group_by,
+                compare_across=phase_col,
+                hold_fixed=hold_deep + [rep_col],
+                expected_groups=n_groups,
+                use_case="trend",
             ))
 
     return contexts
@@ -2226,6 +2293,25 @@ def build_profile_instructions(profile: DataProfile) -> str:
                 )
             lines.append("")
 
+    # ── Ordinal stage trajectory plot guidance ──
+    if profile.ordinal_stages:
+        lines.append("TRAJECTORY PLOTS (required when ordinal stages are present):")
+        lines.append(
+            f"  These columns represent sequential process phases: "
+            f"{', '.join(profile.ordinal_stages)}."
+        )
+        lines.append(
+            "  For each ordinal stage column, you MUST include at least one "
+            "trajectory plot: x-axis = stage order, y-axis = a key measurement, "
+            "with individual experiments distinguishable by colour or facet."
+        )
+        lines.append(
+            "  Distribution plots (boxplots by stage) do NOT replace trajectory "
+            "plots — they cannot show within-run progression or between-run "
+            "alignment across stages."
+        )
+        lines.append("")
+
     # ── Analysis contexts (multi-context grouping guidance) ──
     if ds and ds.analysis_contexts:
         lines.append("ANALYSIS CONTEXTS — use the appropriate context for each analysis question:")
@@ -2268,6 +2354,112 @@ def build_profile_instructions(profile: DataProfile) -> str:
             lines.append("  for stage-level trends). The default grouping is the MINIMUM;")
             lines.append("  extend it when the data structure warrants finer discrimination.")
         lines.append("")
+
+        # ── Required secondary analyses for uncovered meaningful dimensions ──
+        _MEANINGFUL_PURPOSES = {
+            "process_phase", "experimental_condition", "experimental_unit"
+        }
+        rg_cols = set(rg.columns)
+        uncovered_dims: List[Any] = []
+        if ds and ds.dimensions:
+            for _dim in ds.dimensions:
+                if _dim.semantic_purpose in _MEANINGFUL_PURPOSES:
+                    _dim_cols = set(_dim.columns)
+                    if not _dim_cols & rg_cols:
+                        uncovered_dims.append(_dim)
+
+        if uncovered_dims:
+            _purpose_labels = {
+                "experimental_unit": "experimental unit",
+                "experimental_condition": "experimental condition",
+                "process_phase": "process phase",
+            }
+            lines.append(
+                "REQUIRED SECONDARY ANALYSES "
+                "(dimensions NOT covered by the primary key):"
+            )
+            lines.append(
+                "  Your primary grouping key does NOT include all meaningful "
+                "analytical dimensions.  You MUST produce a secondary analysis "
+                "for each dimension listed below — these are NOT optional extras."
+            )
+            lines.append(
+                "  Keep the primary compound-key analysis intact.  Add SEPARATE "
+                "secondary analyses using each missing dimension and store results "
+                "under the 'secondary_analysis' key in analysis_summary.json, "
+                "using the dimension name as the sub-key."
+            )
+            for _dim in uncovered_dims:
+                _plabel = _purpose_labels.get(_dim.semantic_purpose, _dim.semantic_purpose)
+                _vals_str = ""
+                if _dim.sample_values:
+                    _vals_str = (
+                        f" — e.g. {', '.join(str(v) for v in _dim.sample_values[:4])}"
+                    )
+                lines.append(
+                    f"  • {_dim.name} [{_plabel}, {_dim.cardinality} levels"
+                    f"{_vals_str}]"
+                )
+                if _dim.semantic_purpose == "experimental_condition":
+                    lines.append(
+                        f"    → Compare key metrics between {_dim.name} groups "
+                        f"(box/violin plot).  "
+                        f"secondary_analysis['{_dim.name}'] = "
+                        f"{{{{'<value>': {{'metric1': v, ...}}}}}}"
+                    )
+                elif _dim.semantic_purpose == "experimental_unit":
+                    lines.append(
+                        f"    → Summarise metric CVs per {_dim.name} and flag "
+                        f"outlier values.  "
+                        f"secondary_analysis['{_dim.name}'] = "
+                        f"{{{{'<run_id>': {{'cv_percent': v, ...}}}}}}"
+                    )
+                else:
+                    lines.append(
+                        f"    → Show how key metrics change across {_dim.name} "
+                        f"phases.  "
+                        f"secondary_analysis['{_dim.name}'] = "
+                        f"{{{{'<phase>': {{'mean': v, ...}}}}}}"
+                    )
+            lines.append("")
+
+        # ── Per-run × per-stage cross-tabulation ──
+        # Required when both experimental_unit and process_phase dimensions exist.
+        _run_dims = (
+            [d for d in ds.dimensions if d.semantic_purpose == "experimental_unit"]
+            if ds and ds.dimensions else []
+        )
+        _stage_dims = (
+            [d for d in ds.dimensions if d.semantic_purpose == "process_phase"]
+            if ds and ds.dimensions else []
+        )
+        if _run_dims and _stage_dims:
+            _run_col = _run_dims[0].columns[0]
+            _stage_col = _stage_dims[0].columns[0]
+            lines.append("PER_RUN_PER_STAGE CROSS-TABULATION (mandatory for this dataset):")
+            lines.append(
+                f"  This dataset has both {_run_dims[0].name} (experimental unit) "
+                f"and {_stage_dims[0].name} (process phase) dimensions."
+            )
+            lines.append(
+                "  You MUST compute a run × stage cross-tabulation of key metrics "
+                "and store it under the 'per_run_per_stage' key in "
+                "analysis_summary.json."
+            )
+            lines.append(
+                f"  Format: {{'<{_run_col}>__<{_stage_col}>': "
+                "{'metric1': value, 'metric2': value, 'row_count': N}, ...}}"
+            )
+            lines.append(
+                "  Example: group df by ['"
+                + _run_col + "', '" + _stage_col
+                + "'] and compute per-group metric summaries."
+            )
+            lines.append(
+                "  This cross-tabulation is required for cross-validation and "
+                "longitudinal quality tracking across runs and stages."
+            )
+            lines.append("")
 
         # ── Alternative grouping candidates (top 5) ──
         alternatives = [

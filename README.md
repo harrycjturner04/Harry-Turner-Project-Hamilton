@@ -10,7 +10,7 @@ A fully autonomous, LLM-driven system for analysing biologics experimental data 
 - [Architecture](#architecture)
   - [Pipeline Stages](#pipeline-stages)
   - [Agent Orchestration](#agent-orchestration)
-  - [Three-Pass Analysis Strategy](#three-pass-analysis-strategy)
+  - [Five-Pass Analysis Strategy](#five-pass-analysis-strategy)
   - [Gated Review Loop](#gated-review-loop)
   - [Critic Architecture](#critic-architecture)
   - [Targeted Refinement](#targeted-refinement)
@@ -58,21 +58,22 @@ The pipeline is governed by a single configuration file (`context.md`) that desc
 The system processes each input dataset through four sequential stages:
 
 ```
-  Cleaning --> Analysis --> Cross-Validation --> Reporting
-     |            |               |                  |
+  Cleaning ──> Analysis ──> Cross-Validation ──> Reporting
+     │            │               │                  │
      v            v               v                  v
-  Cleaned     Findings +      Verified          Scientific
-  Parquet     Plots + JSON    Claims JSON       Report (PDF)
+  Cleaned     Findings +      Verified           Scientific
+  Parquet     Plots + JSON    Claims JSON +      Report (PDF)
+              + ML Models     claims.json
 ```
 
 | Stage | Purpose | Default Timeout | Default Retries | Output |
 |-------|---------|-----------------|-----------------|--------|
 | **Cleaning** | Remove empty columns, standardise formats, flag anomalies | 900s | 2 | Cleaned parquet + `cleaning_summary.json` |
 | **Analysis** | Generate statistical findings, plots, per-group metrics | 2400s | 5 | `analysis_summary.json` + PNG plots + `data_profile.json` |
-| **Cross-Validation** | Re-compute top claims from raw data to verify accuracy | 900s | 2 | `cross_validation.json` with verified claims |
+| **Cross-Validation** | Re-compute top claims from raw data to verify accuracy | 1800s | 2 | `cross_validation.json` + `claims.json` with verified claims |
 | **Reporting** | Synthesise narrative report with literature context | 900s | 0 | `report.md`, `report.html`, `report.pdf` |
 
-Each stage has a configurable `expert_call_budget` limiting `seek_experts_help()` calls (defaults: cleaning=2, analysis=3, cross_validation=3, report=2; the `_ExpertCallBudget` hardcoded fallback uses analysis=6 to accommodate the multi-pass strategy) and per-GroupChat max rounds (defaults: cleaning=15, analysis=30, cross_validation=15, report=15).
+Each stage has a configurable `expert_call_budget` limiting `seek_experts_help()` calls (defaults: cleaning=2, analysis=3, cross_validation=3, report=2; the `_ExpertCallBudget` hardcoded fallback uses analysis=9 to accommodate the five-pass strategy) and per-GroupChat max rounds (defaults: cleaning=15, analysis=30, cross_validation=15, report=15).
 
 ### Agent Orchestration
 
@@ -80,23 +81,34 @@ The system uses AG2's **CaptainAgent** as the top-level orchestrator:
 
 ```
 User Proxy (captain_user)
-    |
+    │
     v
 CaptainAgent
-    |-- calls seek_experts_help() -->  AutoBuild
-    |                                     |
-    |                                     v
-    |                               Expert GroupChat
-    |                               [data_cleaner, chromatography_expert,
-    |                                Computer_terminal, ...]
-    |                                     |
-    |<-- structured JSON result ----------+
-    |
+    │── calls seek_experts_help() ──>  AutoBuild
+    │        (budget: 9 analysis,        │
+    │         2 no-code max)             v
+    │                              Filtered Agent Library
+    │                              (per-pass isolation:
+    │                               PLAN = full library, no code
+    │                               REVIEW = no ml_modeler, no code
+    │                               EXECUTE/REFLECT = no ml_modeler
+    │                               MODEL = ml_modeler only)
+    │                                    │
+    │                                    v
+    │                              Expert GroupChat
+    │                              [domain experts + Computer_terminal]
+    │                                    │
+    │<── structured JSON result ─────────┘
+    │
     v
-Gated Review Loop (critic registry) --> pass / retry / degrade
-    |
+Pre-critic normalisation (figure_ref injection, deduplication)
+    │
     v
-Next stage...
+Gated Review Loop (critic registry)
+    │── pass ──────────────> Next stage
+    │── retry (scoped) ───> CaptainAgent (top 3 issues if ≥5 MUST_FIX)
+    │── refinement ───────> PLOT_FIX / FINDING_FIX / GAP_FILL
+    └── degrade ──────────> Next stage (with warnings)
 ```
 
 1. **captain_user** sends the task instruction to **CaptainAgent**
@@ -109,22 +121,31 @@ Next stage...
 
 **Wall-clock enforcement**: `_ChatTimeout` wraps each CaptainAgent chat in a SIGALRM-based timeout with a daemon watchdog thread as backup escalation and a hard `os._exit(42)` as a nuclear fallback.
 
-### Three-Pass Analysis Strategy
+### Five-Pass Analysis Strategy
 
-The analysis stage uses a structured three-pass strategy to ensure analytical depth and domain coverage:
+The analysis stage uses a structured five-pass strategy to ensure analytical depth, domain coverage, and predictive modelling:
 
 ```
-Pass 1: PLAN          Pass 2: EXPERT REVIEW       Pass 3: EXECUTE
-analysis_planner -->  domain experts (no code) --> domain experts (with code)
-  |                       |                            |
-  v                       v                            v
-5-8 diverse             reviewed_items +            findings + plots + per_group
-  approaches            expert_additions            + domain_reasoning
+Pass 1: PLAN       Pass 2: REVIEW       Pass 3: EXECUTE       Pass 4: MODEL         Pass 5: REFLECT
+analysis_planner ──> domain experts ────> domain experts ────> ml_modeler ──────────> domain experts
+  │                  (no code)            (with code)           (with code)            (with code)
+  v                  v                    v                     v                      v
+5-8 diverse        reviewed_items +     findings + plots +    ML models, feature     gap analysis,
+  approaches       expert_additions     per_group + domain_   importance, per_group   cross-dimensional
+                                        reasoning             performance             follow-ups
+     ─── no-code budget (2) ───           ─── coding enforced ───────────────────────────────────
+     ─── full agent library ───           ─ no ml_modeler ─    ─ ml_modeler only ─   ─ no ml_modeler ─
 ```
 
-1. **PLAN pass**: `analysis_planner` recommends 5--8 diverse analytical approaches, each referencing the data's dimensional structure. Output is a structured JSON plan with ≥3 chart types.
-2. **EXPERT REVIEW pass**: Domain experts (chromatography, mass spec, statistical) critique the plan without executing code. They add expert_additions and flag gaps.
+1. **PLAN pass**: `analysis_planner` recommends 5–8 diverse analytical approaches, each referencing the data's dimensional structure. Output is a structured JSON plan with ≥3 chart types.
+2. **REVIEW pass**: Domain experts (chromatography, mass spec, statistical) critique the plan without executing code. They add `expert_additions` and flag gaps.
 3. **EXECUTE pass**: Domain experts execute the reviewed plan via code. Output must include `domain_reasoning` with `hypotheses_tested`, `plan_modifications_applied`, and `unexpected_observations`.
+4. **MODEL pass**: `ml_modeler` (only) builds supervised predictive models using the cleaned dataset and findings from Pass 3. Reports model metrics, feature importance, and per-group performance. Appends results to `analysis_summary.json`.
+5. **REFLECT pass** (optional — skipped only if expert call budget is exhausted): Domain experts review execution and modelling results, identify gaps or surprising patterns, explore alternative grouping dimensions, and perform cross-dimensional follow-up analyses. Appends new plots and findings.
+
+**Agent library isolation**: The pipeline dynamically filters the agent library per pass — PLAN passes get the full library (planner selected by text instruction), MODEL passes use an `ml_modeler`-only library, while REVIEW/EXECUTE/REFLECT passes exclude `ml_modeler` entirely, enforced via `_write_filtered_agent_library()`.
+
+**No-code call budget**: A maximum of 2 no-code `seek_experts_help()` calls is allowed (for PLAN + REVIEW). After exhaustion, code execution is forced back on regardless of group name keywords, preventing the LLM from stalling in planning loops.
 
 ### Gated Review Loop
 
@@ -141,44 +162,104 @@ The registry dispatches critics in order, aggregates their `CheckResult` outputs
 
 Quality trajectory is tracked per stage: `(attempt, score, breakdown, critics_ran)`.
 
+**Pre-critic normalisation**: Before each critic pass in the analysis stage, findings missing `figure_ref` keys are automatically matched to the most relevant PNG by token overlap. After the gated review loop exits, findings are deduplicated by normalised text across passes (Execute and Reflect can produce duplicates).
+
+**Scoped retry**: When ≥5 MUST_FIX issues are present, retry instructions are scoped to address only the top 3 to prevent overcorrection. If findings increase by >50% between iterations, the agent is instructed to focus on quality over volume. When a retry causes net regression (more checks PASS→FAIL than FAIL→PASS), the previous artifacts are restored and the next retry receives explicit instructions to make surgical fixes only.
+
 ### Critic Architecture
 
 The `Scripts/critics/` directory contains modular critic modules, each implementing the `CriticModule` ABC. The `CriticRegistry` instantiates all available critics at pipeline init and dispatches them per stage attempt. Each critic produces a `List[CheckResult]` that feeds into the `StageVerdict`.
+
+```
+Stage Output (JSON + PNGs)
+    │
+    v
+┌─ Critic Registry (deterministic dispatch order) ────────────────────────┐
+│                                                                         │
+│  [10] StructuralCritic (Python)                                         │
+│    │── FAIL (missing files, corrupt JSON) ──> short-circuit: skip rest  │
+│    └── PASS ──v                                                         │
+│                                                                         │
+│  [20] ExecutionCritic (Python) ── 9 checks incl. ML accuracy/stability  │
+│    └──v                                                                 │
+│                                                                         │
+│  [30] ContentCritic (LLM) ── rubric-based (7/4/3/6 criteria by stage)   │
+│    └──v                                                                 │
+│                                                                         │
+│  [40] AnalyticalDepthCritic (Python+LLM) ── de-dup with ContentCritic   │
+│    └──v                                                                 │
+│                                                                         │
+│  [50] PlotStructuralCritic (Python) ── PNG headers, aspect ratio tiers  │
+│    │── marks exhausted plots (.png.unfixable)                           │
+│    └──v                                                                 │
+│                                                                         │
+│  [60] VisualCritic (VLM) ── skips exhausted plots                       │
+│    └── MUST_FIX? ── double-evaluation (2nd pass confirms/downgrades)    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    │
+    v
+StageVerdict ──> quality_gate() ──> pass / retry / refinement / degrade
+```
 
 **Execution order** (lower number runs first):
 
 | Order | Critic | Type | Toggle | Default | Stages | What it checks |
 |-------|--------|------|--------|---------|--------|----------------|
-| 10 | `StructuralCritic` | Python | `critic_structural` | `true` | cleaning, analysis, cross_val | File existence, JSON validity, min plots/findings, PNG size, grouping adequacy (WP-1A), domain reasoning field |
-| 20 | `ExecutionCritic` | Python | `critic_execution` | `true` | analysis | NaN leakage, impossible values, uniform groups, finding-data mismatch, plot-finding alignment, duplicate p-values |
-| 30 | `ContentCritic` | LLM | `critic_content` | `true` | cleaning, analysis, cross_val | Rubric-based scoring (8 criteria for analysis, 4 for cleaning, 3 for cross-validation) with coverage validation |
+| 10 | `StructuralCritic` | Python | `critic_structural` | `true` | cleaning, analysis, cross_val | File existence, JSON validity, min plots/findings, PNG size, domain reasoning field |
+| 20 | `ExecutionCritic` | Python | `critic_execution` | `true` | analysis | NaN leakage, impossible values, uniform groups, finding-data mismatch, plot-finding alignment, duplicate p-values (MUST_FIX), feature importance completeness, ML accuracy floor, feature stability (small-N regression) |
+| 30 | `ContentCritic` | LLM | `critic_content` | `true` | cleaning, analysis, cross_val, report | Rubric-based scoring (7 criteria for analysis, 4 for cleaning, 3 for cross-validation, 6 for report) with coverage validation; reference-anchored evaluation prevents regression across retries |
 | 40 | `AnalyticalDepthCritic` | Python + LLM | `critic_analytical_depth` | `false` | analysis | Grouping adequacy, grouping compliance, context coverage, group comparison tests, chart diversity, interpretation depth, domain expectations (YAML-driven), outlier analysis, chart appropriateness, interaction depth |
-| 50 | `PlotStructuralCritic` | Python | `critic_visual` | `true` | analysis | Corrupt PNG detection, resolution (<400px), extreme aspect ratio (>4:1), size outliers, duplicate plots |
-| 60 | `VisualCritic` | VLM | `critic_visual` | `true` | analysis | Plot quality -- basic (aesthetic) or scientific (chart type, grouping, annotations) via graduated severity |
+| 50 | `PlotStructuralCritic` | Python | `critic_visual` | `true` | analysis | Corrupt PNG detection, resolution (<400px), two-tier aspect ratio (>4:1 SHOULD_FIX, >20:1 MUST_FIX), size outliers, duplicate plots |
+| 60 | `VisualCritic` | VLM | `critic_visual` | `true` | analysis | Plot quality -- basic (aesthetic) or scientific (chart type, grouping, annotations, layout quality) via graduated severity; double-evaluation for MUST_FIX (second pass confirms or downgrades) |
 
-**Short-circuit optimisation**: If the structural gate fails on artifact validity checks (missing files, corrupt JSON), LLM/VLM critics are skipped entirely.
+**Short-circuit optimisation**: If the structural gate fails on artifact validity checks (missing files, corrupt JSON), LLM/VLM critics are skipped entirely. Plots previously retired as unfixable (`.png.unfixable`) are tracked as exhausted and excluded from VLM evaluation on subsequent passes.
 
-**De-duplication**: If `ContentCritic` flags `interpretation_depth` as `MUST_FIX`, the `AnalyticalDepthCritic`'s overlapping `depth__bare_deviations` check is downgraded to `SHOULD_FIX` to avoid double-penalising the same gap.
+**De-duplication**: If `ContentCritic` flags `domain_interpretation` as `MUST_FIX`, the `AnalyticalDepthCritic`'s overlapping `depth__bare_deviations` check is downgraded to `SHOULD_FIX` to avoid double-penalising the same gap. Similarly, `depth__missing_group_comparison` is downgraded when `per_group_depth` or `statistical_rigor` is already flagged. The retry instruction builder also suppresses redundant checks via a subsumption map, preventing contradictory guidance to the generator.
 
-**Quality scoring**: Each `CheckResult` maps to passed=1.0, should_fix=0.5, must_fix=0.0. Content and plot checks receive 2× weight. A coverage penalty of −0.05 applies per skipped evaluator. Domain-specific expectations are loaded from `critics/domain_biologics.yaml` (not hardcoded Python keywords).
+**Quality scoring**: Each `CheckResult` maps to passed=1.0, should_fix=0.5, must_fix=0.0. Content and plot checks receive 2× weight. Visual quality score excludes cosmetic-category checks to prevent score inflation. A coverage penalty of −0.05 applies per skipped evaluator. Domain-specific expectations are loaded from `critics/domain_biologics.yaml` (not hardcoded Python keywords).
 
 **Gate decision logic** (`quality_gate()` in `tools.py`):
 - No must_fix + evaluators ran → `passed`
 - Only should_fix → `passed` with warnings (unless ≥ `should_fix_accumulation_threshold` accumulated → retry)
 - must_fix + retry budget exhausted → `passed_degraded`
 - must_fix + same failures for `issue_stall_max_consecutive` attempts → `passed_degraded` (stall detection)
-- must_fix + budget remaining → route to refinement tier
+- must_fix + budget remaining → route to refinement tier; net regression detection flags when a retry made things worse (more checks PASS→FAIL than FAIL→PASS)
+
+**Regression firewall**: When the quality gate detects net regression after a full CaptainAgent retry, the previous attempt's `analysis_summary.json` is restored from backup, and subsequent retry instructions mandate surgical-only fixes to prevent wholesale replacement from destroying passing content.
+
+**Reference-anchored evaluation**: The content evaluator receives the previous attempt's passed checks as an anchor. Previously-passing criteria can only be failed if the current output is genuinely worse on that specific dimension, creating monotonic evaluation pressure across retries.
 
 **Critic logging**: Each critic run is appended to `{label}__critic_log.jsonl` with checks produced, must_fix count, should_fix count, and wall_time_ms.
 
 ### Targeted Refinement
 
-When `targeted_refinement: true`, the system attempts surgical fixes before falling back to a full CaptainAgent retry. Refinement directives are built from the quality gate's analysis of must_fix failures. An `IssueTracker` tracks per-issue stall across attempts (downgrades after `issue_stall_max_consecutive` = 4 occurrences without resolution).
+When `targeted_refinement: true`, the system attempts surgical fixes before falling back to a full CaptainAgent retry. Refinement directives are built from the quality gate's analysis of must_fix failures. An `IssueTracker` tracks per-issue stall across attempts (downgrades after `issue_stall_max_consecutive` = 2 occurrences without resolution).
+
+```
+quality_gate() ── must_fix + budget remaining
+    │
+    v
+Refinement Scope Selection (most targeted first when cascade=true)
+    │
+    ├── plot-only failures ──> PLOT_FIX
+    │     │── attempt 1: LLM regenerates plot ──> VLM verify
+    │     │── attempt 2: retry if still failing
+    │     └── retire unfixable (.png.unfixable) ──> track as exhausted
+    │
+    ├── content failures ──> FINDING_FIX
+    │     └── rewrite specific findings, preserve numeric values
+    │
+    ├── depth__ failures ──> GAP_FILL
+    │     └── generate + execute code, APPEND results
+    │
+    └── fallback ──> FULL_RERUN (CaptainAgent retry with directives)
+```
 
 | Scope | When triggered | What happens |
 |-------|---------------|-------------|
-| `PLOT_FIX` | Plot-only must_fix failures | Direct LLM call to regenerate failing plots, post-fix VLM verification, deletion pathway for unfixable plots |
-| `FINDING_FIX` | Content must_fix with identifiable ref | Rewrite specific findings in analysis_summary.json, preserving numeric values |
+| `PLOT_FIX` | Plot-only must_fix failures | Direct LLM call (up to 2 attempts per plot) to regenerate failing plots, post-fix VLM verification, retirement pathway for unfixable plots (renamed to `.png.unfixable`, tracked as exhausted) |
+| `FINDING_FIX` | Content must_fix with identifiable ref | Surgical merge: identifies specific failing findings by ref/text match, rewrites only those via LLM, merges back by index preserving untouched findings and metadata (figure_ref); falls back to full rewrite if no specific findings identified |
 | `GAP_FILL` | Analytical depth must_fix (`depth__` prefix) | Generate and execute code for missing analytical dimensions (ANOVA, correlations, etc.), APPENDs results |
 | `FULL_RERUN` | Always available as final escalation | Full CaptainAgent retry with retry instructions |
 
@@ -186,23 +267,25 @@ When `refinement_cascade: true`, the system escalates through scopes (most targe
 
 ### Report Pipeline
 
-The report pipeline (`report_pipeline.py`) generates publication-quality scientific reports via a four-phase architecture. It runs after the captain pipeline completes all per-file stages.
+The report pipeline (`report_pipeline.py`) generates publication-quality scientific reports via a five-phase architecture. It runs after the captain pipeline completes all per-file stages. This is the primary report generation path — the captain pipeline's built-in report stage serves only as a fallback.
 
-**Per-file report** (four phases):
+**Per-file report** (five phases):
 
 ```
-Phase 1: Research      Phase 2: KB Queries     Phase 3: GroupChat        Phase 4: Assembly
-DeepResearchAgent  --> ChromaDB RAG queries --> Vis + Interpretation  --> MD → HTML → PDF
-  |                      |                     agents (deterministic      |
-  v                      v                     speaker selection)         v
-background,          domain-specific           report.md + figures       report.pdf
-citations            reference ranges
+Phase 1: Research      Phase 2: KB Queries     Phase 3: GroupChat        Phase 3d: WP-R        Phase 4: Assembly
+DeepResearchAgent  --> ChromaDB RAG queries --> Vis + Interpretation  --> Quality Gate      --> MD → HTML → PDF
+  |                      |                     agents (deterministic      |                      |
+  v                      v                     speaker selection)         v                      v
+background,          domain-specific           report.md + figures       critic review,         report.pdf
+citations            reference ranges          (incl. Models section     numerical checks,
+                                               when ML data present)     grounding revision
 ```
 
 1. **Research**: DeepResearchAgent (Playwright browser-use) gathers literature background. Circuit breaker disables after 3 consecutive failures. Falls back to WebSurferAgent (crawl4ai) if unavailable.
 2. **Knowledge base queries**: Local ChromaDB RAG with `all-MiniLM-L6-v2` embeddings indexes all `knowledge_base/*.md` files (600-char chunks, 80-char overlap). No external API required.
-3. **GroupChat**: VisualisationAgent generates figures (max 5 turns), then InterpretationAgent writes the narrative report. Figure manifest injection ensures InterpretationAgent knows which exact files were generated. Report terminates on `REPORT_COMPLETE` message.
-4. **Assembly**: `_assemble_report_with_figures()` embeds inline "Figure N" references via stem/prefix matching, then appends unreferenced figures grouped by analytical theme. PDF rendered via WeasyPrint (branded CSS, A4, page numbers) with reportlab fallback.
+3. **GroupChat**: VisualisationAgent generates figures (max 5 turns), then InterpretationAgent writes the narrative report. Figure manifest injection ensures InterpretationAgent knows which exact files were generated. When the analysis summary contains an `ml_modeling` key, InterpretationAgent includes a **Predictive Modelling** section covering model performance, feature importance, and process predictability insights. Report terminates on `REPORT_COMPLETE` message.
+4. **WP-R quality gate** (`report_quality.py`): The report undergoes up to 2 revision rounds. Checks include: LLM narrative critic (6-criteria rubric), numerical consistency (prose vs JSON artifacts), and quantitative grounding rate. Issues are aggregated and the top 10 by severity feed a single revision LLM call per round. Reports generated from degraded analyses automatically receive a quality caveat noting that the underlying analysis exited the quality gate in a degraded state. Quality gate checks can be individually disabled via `run_config` toggles for ablation baseline behaviour.
+5. **Assembly**: `_assemble_report_with_figures()` embeds inline "Figure N" references via stem/prefix matching, then appends unreferenced figures grouped by analytical theme. PDF rendered via WeasyPrint (branded CSS, A4, page numbers) with reportlab fallback.
 
 **Global cross-file report** (when 2+ files have findings):
 - Separate GroupChat with `GlobalInterpretationAgent` for self-contained cross-file comparison
@@ -232,10 +315,10 @@ Agents are selected dynamically per-task via schema-driven activation scoring (`
 | `chromatography_expert` | Baseline correction, peak detection, system suitability (SEC, IEX, domain thresholds) |
 | `mass_spec_expert` | Mass accuracy, charge-state validation, glycoform analysis (reference masses, S/N, PTM detection) |
 | `statistical_analyst` | Descriptive statistics, correlations, outlier detection (max 5 plots, group-level focus) |
-| `analysis_planner` | Recommends 5--8 analysis strategies with dimensional structure awareness (Mode A: strategy, Mode B: EDA) |
-| `ml_modeler` | Machine learning (classification, regression, clustering) with TabPFN support and supervised task definitions |
+| `analysis_planner` | Recommends 5--8 analysis strategies with dimensional structure awareness, grouping rationale per entry, and at least one supervised ML task (Mode A: strategy, Mode B: EDA) |
+| `ml_modeler` | Machine learning (classification, regression, clustering) with TabPFN support, supervised task definitions, and small-N requirements (N<200: mandatory CV uncertainty, feature stability, regularisation comparison) |
 | `cross_validator` | Independent re-computation of statistical claims from parquet with dynamic group-level and completeness checks |
-| `report_writer` | Synthesises scientific narratives with mandatory sections (exec summary through recommendations) |
+| `report_writer` | Synthesises scientific narratives with pre-embedded data (no code execution step) and domain-conditional acceptance thresholds |
 
 **Extended agents** (available when `expert_library: "extended"`):
 
@@ -248,7 +331,7 @@ Agents are selected dynamically per-task via schema-driven activation scoring (`
 **Prompt versions** (controlled by `prompt_version` toggle):
 - `"v1"` -- baseline: CODE_GUIDANCE_TEMPLATE only
 - `"v2"` -- enhanced: three-component interpretation (numeric + biological + actionable) + actual p-values
-- `"v3"` -- graduated: flexible interpretation depth + mandatory data profile usage + dimensional structure awareness
+- `"v3"` -- graduated: flexible interpretation depth + mandatory data profile usage + dimensional structure awareness + 2+ secondary analyses + multi-column grouping exploration + experimental condition annotation from parameters file
 
 ### Monkey-Patches & Robustness Guards
 
@@ -289,7 +372,8 @@ The pipeline applies several monkey-patches to AG2 and Qwen3.5 to ensure stabili
 |   |-- main.py                 # CLI entry point (arg parsing, ServerManager, report-only mode)
 |   |-- captain_pipeline.py     # Core orchestrator (CaptainAgent, stages, gated review, monkey-patches)
 |   |-- schema_profiler.py      # WP-1: Column role classification, grouping inference, distribution profiling
-|   |-- report_pipeline.py      # Four-phase report generation (Research + KB + GroupChat + Assembly)
+|   |-- report_pipeline.py      # Five-phase report generation (Research + KB + GroupChat + WP-R Quality Gate + Assembly)
+|   |-- report_quality.py       # WP-R: Report quality gate (narrative critic, numerical consistency, grounding revision)
 |   |-- prompts.py              # All agent system prompts (v1/v2/v3) + code guidance template
 |   |-- tools.py                # Quality gate, structural gate, CheckResult/StageVerdict/GateResult types
 |   |-- context_parser.py       # Parses context.md into RunPlan/RunConfig/StageSpec
@@ -300,7 +384,7 @@ The pipeline applies several monkey-patches to AG2 and Qwen3.5 to ensure stabili
 |   |   |-- __init__.py
 |   |   |-- base.py             # CriticModule ABC, CriticContext dataclass
 |   |   |-- registry.py         # CriticRegistry: discovery, ordering, dispatch, de-duplication
-|   |   |-- structural.py       # Pure Python file/JSON checks + grouping adequacy + domain reasoning
+|   |   |-- structural.py       # Pure Python file/JSON checks + domain reasoning
 |   |   |-- content.py          # LLM rubric-based evaluation (delegates to pipeline._run_content_evaluator)
 |   |   |-- visual.py           # VLM plot quality review (delegates to pipeline._run_plot_quality_evaluator)
 |   |   |-- analytical_depth.py # WP-C3a: 10 heuristic checks + optional LLM depth assessment
@@ -316,11 +400,12 @@ The pipeline applies several monkey-patches to AG2 and Qwen3.5 to ensure stabili
 |       |-- rubrics.py          # Rubric definitions (versioned)
 |       |-- judge.py            # LLM-as-Judge via OpenRouter
 |       |-- scoring.py          # Score aggregation
-|       |-- pairwise.py         # Pairwise comparison logic
-|       |-- statistics.py       # Statistical analysis of evaluation results
+|       |-- pairwise.py         # Pairwise comparison logic (position-swap consistency)
+|       |-- statistics.py       # Statistical analysis (CoV, Krippendorff's alpha)
 |       |-- ablation.py         # Ablation study analysis
 |       |-- visualization.py    # Results visualisation
-|       |-- storage.py          # SQLite evaluation database
+|       |-- storage.py          # SQLite evaluation database (schema v2)
+|       |-- deterministic.py    # Deterministic metrics: gate scores, data coverage, grounding rate
 |       '-- launch_replicates.sh  # Launch multiple evaluation runs
 |
 |-- critics/
@@ -494,6 +579,7 @@ Options:
 | `VLLM_READY_TIMEOUT_S` | vLLM readiness probe timeout | `600` |
 | `HUGGINGFACE_API_KEY` | HF token for gated model downloads | (none) |
 | `CRITIC_OPENROUTER_API_KEY` | OpenRouter API key for content/plot evaluators | (none) |
+| `OPENROUTER_API_KEY` | OpenRouter API key for evaluation framework (falls back to `CRITIC_OPENROUTER_API_KEY`, then YAML config) | (none) |
 | `CRITIC_BASE_URL` | OpenRouter endpoint | `https://openrouter.ai/api/v1` |
 | `CRITIC_MODEL` | Content evaluator model (via OpenRouter) | `x-ai/grok-4.1-fast` |
 | `CRITIC_VISION_MODEL` | Plot quality evaluator model (via OpenRouter) | `x-ai/grok-4.1-fast` |
@@ -558,7 +644,10 @@ pipeline:
     no_aggregation_across: [run_no]
     grouping_columns: [run_no, chromatography_stage, Sample_Code]
     grouping_extend_when_present: [chromatography_stage, Sample_Code]  # finer grouping when columns exist
+    parameters_path: "Data/Parameters.xlsx"  # Optional: supplementary metadata file for experimental conditions
 ```
+
+When `parameters_path` is set, the pipeline loads the file, summarises its column structure, and builds an experimental condition map (first column = run/experiment ID, remaining columns = conditions). This injects domain context into agent prompts and enables experimental condition annotation in findings.
 
 ### Quality Thresholds
 
@@ -568,8 +657,8 @@ pipeline:
 | `min_findings` | all | 2-3 | Minimum analytical findings |
 | `require_per_group` | analysis | true | Must produce per-group structure |
 | `max_retries` | cleaning=2, analysis=5, cross_val=2, report=0 | varies | Maximum retry attempts |
-| `expert_call_budget` | cleaning=2, analysis=3, cross_val=3, report=2 | varies | Maximum `seek_experts_help` calls (context.md defaults; pipeline fallback uses analysis=6) |
-| `chat_timeout` | cleaning=900, analysis=2400, cross_val=900, report=900 | varies | Per-stage wall-clock timeout (seconds) |
+| `expert_call_budget` | cleaning=2, analysis=3, cross_val=3, report=2 | varies | Maximum `seek_experts_help` calls (context.md defaults; pipeline fallback uses analysis=9 to accommodate the five-pass strategy) |
+| `chat_timeout` | cleaning=900, analysis=2400, cross_val=1800, report=900 | varies | Per-stage wall-clock timeout (seconds) |
 | `png_min_bytes` | analysis | 5000 | Minimum PNG file size |
 | `summary_size_bounds` | all | (1024, 500000) | Acceptable JSON summary size range |
 
@@ -597,7 +686,7 @@ The `run_config` block controls experimental features via independently togglabl
 |--------|------|---------|-------------|
 | `schema_profiling` | string | `"disabled"` | `"disabled"` / `"roles_only"` (Phase A: column roles + grouping) / `"full"` (Phase A+B: + distributions + technique recommendations) |
 
-When enabled, the schema profiler classifies every column by role (identifier, categorical_group, ordinal_stage, continuous_measurement, metadata_text, datetime, constant) and infers semantic purposes (experimental_unit, experimental_condition, process_phase, technical_replicate). It builds a dimensional structure with nesting/crossing relationships and recommends grouping candidates scored by quality (group count, evenness, min size, coverage). In `"full"` mode, it also profiles distributions (normality, modality, skewness) and recommends statistical techniques.
+When enabled, the schema profiler classifies every column by role (identifier, categorical_group, ordinal_stage, continuous_measurement, metadata_text, datetime, constant) and infers semantic purposes (experimental_unit, experimental_condition, process_phase, technical_replicate). It builds a dimensional structure with nesting/crossing relationships and recommends grouping candidates scored by quality (group count, evenness, min size, coverage) with a dimensionality bonus (+0.10 per column beyond first, capped at +0.30). In `"full"` mode, it also profiles distributions (normality, modality, skewness), recommends statistical techniques, generates two additional analysis contexts (`interaction_analysis` for 3+ dimension crossings and `deep_process_trend` for full hierarchy with replicates), and includes trajectory plot guidance for ordinal stages.
 
 #### WP-2: Adaptive Convergence
 
@@ -607,13 +696,14 @@ When enabled, the schema profiler classifies every column by role (identifier, c
 | `convergence_threshold` | float | `0.03` | Min quality score improvement to continue iterating |
 | `convergence_target` | float | `0.92` | Quality score at which to stop early (if no MUST_FIX) |
 | `should_fix_accumulation_threshold` | int | `4` | Retry if ≥ this many SHOULD_FIX issues accumulated |
-| `issue_stall_max_consecutive` | int | `4` | Downgrade persistent issue to SHOULD_FIX after N consecutive attempts |
+| `issue_stall_max_consecutive` | int | `2` | Downgrade persistent issue to SHOULD_FIX after N consecutive attempts |
+| `min_iterations` | int | `0` | Minimum attempts before accepting any degraded exit |
 
 #### WP-3: Scientific Visual Review
 
 | Toggle | Type | Default | Description |
 |--------|------|---------|-------------|
-| `visual_review_mode` | string | `"basic"` | `"basic"` (aesthetic) / `"scientific"` (graduated severity: scientific_validity → MUST_FIX, statistical_completeness → SHOULD_FIX, cosmetic → informational) |
+| `visual_review_mode` | string | `"basic"` | `"basic"` (aesthetic) / `"scientific"` (graduated severity: scientific_validity → MUST_FIX, statistical_completeness → MUST_FIX, layout_quality → SHOULD_FIX, cosmetic → informational; double-evaluation confirms MUST_FIX) |
 | `require_figure_references` | bool | `false` | Enforce claim-figure mapping in findings (`findings["figure_ref"]` → disk PNG) |
 
 #### WP-4: Pluggable Agent Library
@@ -634,6 +724,16 @@ When enabled, the schema profiler classifies every column by role (identifier, c
 | `critic_execution` | bool | `true` | Execution correctness checks: NaN leakage, impossible values, data-finding mismatch (WP-C3b) |
 | `targeted_refinement` | bool | `false` | Enable PLOT_FIX / FINDING_FIX / GAP_FILL paths (WP-C2) |
 | `refinement_cascade` | bool | `false` | Escalate through refinement scopes before full rerun |
+
+#### WP-R: Report Quality Controls
+
+These toggles control quality gates applied to the **report pipeline** output (Phase 3d), not the captain pipeline fallback report. When all toggles are at defaults, the quality gate is a no-op and reports pass through unchanged.
+
+| Toggle | Type | Default | Description |
+|--------|------|---------|-------------|
+| `critic_report` | bool | `true` | LLM rubric check on report pipeline output (6 criteria: executive summary quality, numerical fidelity, conclusion support, data faithfulness, section completeness, synthesis vs enumeration). Uses OpenRouter critic client (`CRITIC_OPENROUTER_API_KEY`). |
+| `min_quantitative_grounding` | float | `0.0` | Trigger grounding revision if fraction of quantitative paragraphs is below threshold (0.0 = disabled). Applied after GroupChat produces the report, before figure assembly. |
+| `numerical_accuracy_check` | bool | `true` | Pure-Python heuristic: flag numbers in report prose that contradict analysis/cleaning JSON artifacts |
 
 #### ML Modelling
 
@@ -715,7 +815,8 @@ Outputs/slurm_{JOB_ID}_{TIMESTAMP}/
 |   |   |-- data_profile.json       # Schema profiler output (when enabled)
 |   |   '-- artifacts/*.png
 |   '-- cross_validation/
-|       '-- cross_validation.json    # verified_claims, conflicts, gaps, recommendations
+|       |-- cross_validation.json    # verified_claims, conflicts, gaps, recommendations
+|       '-- claims.json              # Verified claims (written unconditionally)
 |-- reports/{dataset}/
 |   |-- report.md
 |   |-- report.html
@@ -737,11 +838,28 @@ Outputs/slurm_{JOB_ID}_{TIMESTAMP}/
 An LLM-as-Judge evaluation framework (`Scripts/evaluation/`) enables systematic comparison of pipeline outputs across ablation studies. Configuration is in `evaluation_config.yaml`.
 
 **Architecture**:
+- **Deterministic metrics layer** (`deterministic.py`): Ingests pipeline-internal gate quality scores from `debug/*__gate.json` files and computes three report-level metrics without LLM calls: `data_coverage_rate` (fraction of dataset columns referenced in report), `figure_reference_rate` (fraction of generated figures cited), and `quantitative_grounding_rate` (fraction of analytical paragraphs containing numbers — same metric used by the WP-R quality gate in the report pipeline)
 - Multi-model judging via OpenRouter (configurable in `evaluation_config.yaml`; vision-capable models recommended)
 - Versioned rubrics (`rubrics.py`) with per-dimension scoring
-- Pairwise comparison mode for head-to-head run evaluation
+- Pairwise comparison with position-swap consistency checking: each comparison runs twice (A-first, B-first) and the verdict is accepted only when both orderings agree, mitigating position bias
 - Configurable artifact truncation (report: 15K chars, analysis: 10K chars, max 10 plots per eval)
-- SQLite storage (`Evaluation/evaluation.db`) for historical results
+- SQLite storage (`Evaluation/evaluation.db`, schema v2) with per-stage gate quality metrics and auto-migration from v1
+- **Gate quality vs CV quality split**: gated stages (cleaning, analysis) report `gate.json` quality scores; cross-validation uses a direct call path with no gate loop and is reported separately via structural metrics (`verified_claims_count`, `cv_gaps_count`)
+- **Config-level rankings**: Bradley-Terry and Elo scores computed at run level, then aggregated per configuration label by averaging across replications — prevents individual outlier runs from dominating rankings
+- **Per-dataset and per-judge score breakdowns**: overall scores disaggregated by dataset and by judge model, surfacing dataset difficulty effects and judge calibration bias
+- **Inter-judge agreement**: Krippendorff's alpha per criterion (≥0.8 good, 0.6–0.8 acceptable)
+- **Repeatability**: Coefficient of variation (CoV) across replicated runs (<0.15 stable, >0.25 high variance)
+
+**CLI subcommands**:
+```bash
+python -m Scripts.evaluation deterministic Outputs/slurm_*         # Ingest gate scores + report metrics (no LLM)
+python -m Scripts.evaluation evaluate Outputs/slurm_*              # LLM-as-Judge scoring
+python -m Scripts.evaluation pairwise Outputs/run_A Outputs/run_B  # Head-to-head comparison
+python -m Scripts.evaluation ablation                               # Full ablation report (all configs in DB)
+python -m Scripts.evaluation ablation --configs Baseline WP1        # Restrict to specific configs only
+python -m Scripts.evaluation repeatability                          # CoV repeatability table
+python -m Scripts.evaluation full Outputs/slurm_*                  # Full pipeline (deterministic → evaluate → ablation)
+```
 
 **Cross-run comparison** (`compare_runs.py`):
 ```bash
@@ -786,6 +904,12 @@ With `schema_profiling: "full"` enabled, the system classifies columns by role, 
 - ~~BS-3: GroupChat round exhaustion~~ -- mitigated by convergence control (WP-2), disk-artifact recovery, and quality-driven stopping
 - ~~BS-4: Payload truncation~~ -- replaced hardcoded char slices with configurable `payload_budget_*` fields in run_config, tuned for 128K context window
 - ~~Critic feedback loop non-functional~~ -- replaced by modular critic registry (WP-C1) with deterministic dispatch and per-critic toggling
+- ~~Content evaluator oscillation~~ -- stabilised via criteria merge (8→7), few-shot examples, reference-anchored evaluation, and check subsumption de-duplication
+- ~~Wholesale replacement on retry~~ -- mitigated by regression firewall (artifact rollback on net regression), surgical finding merge, and explicit preservation instructions
+- ~~Contradictory check pressure~~ -- resolved by check dependency ordering (severity downgrade cascades) and retry instruction deduplication via subsumption map
+- ~~Stall threshold unreachable~~ -- `issue_stall_max_consecutive` reduced from 4 to 2, aligned with typical retry budgets
+- ~~Report pipeline ignores degraded flag~~ -- degraded analyses now receive quality caveat in reports; report quality gate defaults to enabled
+- ~~Duplicate grouping checks~~ -- removed from StructuralCritic; sole ownership moved to AnalyticalDepthCritic
 
 ---
 

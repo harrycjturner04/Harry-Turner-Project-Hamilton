@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from captain_pipeline import run_captain_pipeline, ServerManager, PipelineMode
+from context_parser import RunConfig
 from report_pipeline import run_report_pipeline
 
 
@@ -122,6 +123,7 @@ def main() -> int:
             manifest=manifest,
             llm_config=llm_config,
             output_dir=Path(args.output_dir),
+            run_config=RunConfig.from_dict(manifest.get("run_config", {})),
         )
         logging.info("Report pipeline complete. Reports at: %s", report_result.get("reports_dir"))
         return 0
@@ -148,13 +150,14 @@ def main() -> int:
     if not args.skip_report:
         logging.info("Starting report pipeline...")
         try:
-            _rc = manifest.get("run_config", {})
+            _rc = RunConfig.from_dict(manifest.get("run_config", {}))
             report_result = run_report_pipeline(
                 manifest=manifest,
                 llm_config=llm_config,
                 output_dir=Path(args.output_dir),
-                figure_selection=_rc.get("figure_selection", "all"),
-                max_report_figures=_rc.get("max_report_figures", 10),
+                figure_selection=_rc.figure_selection,
+                max_report_figures=_rc.max_report_figures,
+                run_config=_rc,
             )
             logging.info(
                 "Report pipeline complete. Reports at: %s",

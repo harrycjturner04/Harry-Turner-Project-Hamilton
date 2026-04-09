@@ -56,7 +56,7 @@ DEFAULT_EXPERT_CALL_BUDGETS = {
 DEFAULT_CHAT_TIMEOUTS = {
     "cleaning": 900,
     "analysis": 2400,       # 4 expert calls × ~7 min each; needs ~30 min
-    "cross_validation": 900,
+    "cross_validation": 1800,  # 3 expert calls × ~7 min each; needs ~25 min
     "report": 900,
 }
 
@@ -95,6 +95,7 @@ class RunConfig:
     iteration_strategy: str = "fixed"       # WP-2: "none"|"fixed"|"convergent"
     convergence_threshold: float = 0.03     # WP-2: min improvement to continue iterating
     convergence_target: float = 0.92        # WP-2: quality score at which to stop early
+    min_iterations: int = 0                 # WP-2: minimum attempts before accepting any degraded exit
     should_fix_accumulation_threshold: int = 4  # retry if >= this many SHOULD_FIX
     issue_stall_max_consecutive: int = 4    # downgrade persistent issue after N attempts
     expert_library: str = "baseline"        # WP-4: "baseline"|"extended"
@@ -118,9 +119,20 @@ class RunConfig:
     refinement_cascade: bool = False        # enable escalation cascade
     ml_backend: str = "sklearn"              # "sklearn"|"tabpfn"|"both" — ML modeler backend
     max_input_tokens: int = 55_000           # token budget for trim_payload_to_budget
+    # WP-R3: Report narrative critic (non-blocking quality gate for final report)
+    critic_report: bool = False              # enable LLM rubric check on final report
+    # WP-R4: Quantitative grounding feedback loop (0.0 = disabled)
+    min_quantitative_grounding: float = 0.0  # trigger grounding revision if below threshold
+    # WP-R6: Numerical accuracy check in revision loop
+    numerical_accuracy_check: bool = False   # check prose numbers against JSON artifacts
 
     def to_dict(self) -> Dict[str, Any]:
         return _asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "RunConfig":
+        """Reconstruct a RunConfig from a serialised dict (e.g. from manifest)."""
+        return _build_run_config(raw)
 
 
 @dataclass
@@ -167,6 +179,7 @@ class ConstraintSpec:
     no_aggregation_across: List[str] = field(default_factory=list)
     grouping_columns: List[str] = field(default_factory=list)
     grouping_extend_when_present: List[str] = field(default_factory=list)
+    parameters_path: Optional[str] = None  # Optional path to supplementary parameters/metadata file
 
 
 @dataclass
@@ -417,6 +430,7 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
         iteration_strategy=str(raw.get("iteration_strategy", defaults.iteration_strategy)),
         convergence_threshold=float(raw.get("convergence_threshold", defaults.convergence_threshold)),
         convergence_target=float(raw.get("convergence_target", defaults.convergence_target)),
+        min_iterations=int(raw.get("min_iterations", defaults.min_iterations)),
         expert_library=str(raw.get("expert_library", defaults.expert_library)),
         agent_definitions_dir=str(raw.get("agent_definitions_dir", defaults.agent_definitions_dir)),
         # BS-4: Payload budget controls
@@ -436,6 +450,14 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
         refinement_cascade=bool(raw.get("refinement_cascade", defaults.refinement_cascade)),
         # TabPFN integration
         ml_backend=str(raw.get("ml_backend", defaults.ml_backend)),
+        # WP-R3/R4/R6: Report quality controls
+        critic_report=bool(raw.get("critic_report", defaults.critic_report)),
+        min_quantitative_grounding=float(
+            raw.get("min_quantitative_grounding", defaults.min_quantitative_grounding)
+        ),
+        numerical_accuracy_check=bool(
+            raw.get("numerical_accuracy_check", defaults.numerical_accuracy_check)
+        ),
     )
     if cfg.visual_review_mode not in ("basic", "scientific"):
         logger.warning(
@@ -484,11 +506,13 @@ def _build_run_config(raw: Dict[str, Any]) -> RunConfig:
 
 def _build_constraint_spec(raw: Dict[str, Any]) -> ConstraintSpec:
     """Build a ConstraintSpec from raw YAML."""
+    params_path = raw.get("parameters_path")
     return ConstraintSpec(
         preserve_columns=list(raw.get("preserve_columns", DEFAULT_PRESERVE_COLUMNS)),
         no_aggregation_across=list(raw.get("no_aggregation_across", [])),
         grouping_columns=list(raw.get("grouping_columns", [])),
         grouping_extend_when_present=list(raw.get("grouping_extend_when_present", [])),
+        parameters_path=str(params_path) if params_path is not None else None,
     )
 
 

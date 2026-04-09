@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p cuda
 #SBATCH --gres=gpu:h200_nvl:1
-#SBATCH -t 12:00:00
+#SBATCH -t 18:00:00
 #SBATCH --job-name=Harry_Turner_Project
 
 #SBATCH -o %x_%j.out
@@ -144,7 +144,7 @@ python -m vllm.entrypoints.openai.api_server \
   --host 0.0.0.0 \
   --tensor-parallel-size 1 \
   --max-model-len 262144 \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization 0.92 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \

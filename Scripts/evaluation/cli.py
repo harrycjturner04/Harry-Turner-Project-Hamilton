@@ -2,20 +2,26 @@
 
 Usage::
 
-    # Evaluate all runs
+    # Ingest gate scores and report metrics (no LLM calls, run first)
+    python -m Scripts.evaluation.cli deterministic --glob "Outputs/slurm_*"
+
+    # Evaluate all runs with LLM judges
     python -m Scripts.evaluation.cli evaluate --glob "Outputs/slurm_*"
 
     # Pairwise comparisons
     python -m Scripts.evaluation.cli pairwise --glob "Outputs/slurm_*"
 
-    # Ablation analysis
+    # Ablation analysis (includes gate metrics and cross-WP correlation)
     python -m Scripts.evaluation.cli ablation --baseline "baseline-v2" \\
         --glob "Outputs/slurm_*"
+
+    # Repeatability (CoV) table
+    python -m Scripts.evaluation.cli repeatability
 
     # Export for dissertation
     python -m Scripts.evaluation.cli export --format latex
 
-    # Full pipeline
+    # Full pipeline (deterministic → evaluate → pairwise → ablation)
     python -m Scripts.evaluation.cli full --glob "Outputs/slurm_*" \\
         --baseline "baseline-v2"
 """
@@ -29,14 +35,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .ablation import (
+    aggregate_rankings_by_config,
     collect_config_scores,
+    collect_cv_structural_metrics,
+    collect_gate_metrics,
+    collect_judge_agreement,
+    collect_per_dataset_scores,
+    collect_per_judge_scores,
     compute_all_replication_stats,
+    cross_wp_correlation_from_judgments,
     generate_ablation_report,
     generate_all_figures,
     generate_comparison_pairs,
     generate_latex_exports,
     run_statistical_comparisons,
 )
+from .deterministic import ingest_run_deterministic
 from .artifacts import index_run_artifacts
 from .config import EvalConfig, build_openrouter_client, load_config
 from .judge import (
@@ -51,6 +65,7 @@ from .pairwise import (
     compute_bradley_terry,
     compute_elo_ratings,
     pairwise_compare,
+    pairwise_compare_with_swap,
 )
 from .pairwise import response_hash as pairwise_response_hash
 from .registry import RunRecord, discover_runs, group_by_config
@@ -314,7 +329,7 @@ def cmd_pairwise(args: argparse.Namespace) -> int:
                           f"{run_b.run_id} on {ds_name} "
                           f"({judge_model.display_name})...")
                     try:
-                        result = pairwise_compare(
+                        result = pairwise_compare_with_swap(
                             run_a_id=run_a.run_id,
                             run_b_id=run_b.run_id,
                             report_a=report_a,
@@ -325,22 +340,33 @@ def cmd_pairwise(args: argparse.Namespace) -> int:
                             max_chars=config.max_report_chars,
                         )
                         rhash = pairwise_response_hash(
-                            result.raw_response
+                            result.primary.raw_response
                         )
+                        explanation = result.primary.explanation
+                        if result.inconsistency_note:
+                            explanation = (
+                                f"{explanation}\n\n"
+                                f"[Position-swap: {result.inconsistency_note}]"
+                            )
                         db.insert_pairwise(
-                            run_a_id=result.run_a_id,
-                            run_b_id=result.run_b_id,
+                            run_a_id=result.primary.run_a_id,
+                            run_b_id=result.primary.run_b_id,
                             dataset_name=ds_name,
-                            judge_model=result.judge_model,
+                            judge_model=result.primary.judge_model,
                             winner=result.winner,
-                            confidence=result.confidence,
-                            explanation=result.explanation,
-                            criterion_preferences=result.criterion_preferences,
+                            confidence=result.primary.confidence,
+                            explanation=explanation,
+                            criterion_preferences=result.primary.criterion_preferences,
                             raw_response_hash=rhash,
-                            presentation_order=result.presentation_order,
+                            presentation_order="swap_check",
                         )
-                        print(f"    Winner: {result.winner} "
-                              f"(confidence: {result.confidence:.2f})")
+                        status = (
+                            f"consistent → {result.winner}"
+                            if result.consistent
+                            else "inconsistent → tie"
+                        )
+                        print(f"    {status} "
+                              f"(confidence: {result.primary.confidence:.2f})")
                     except Exception as exc:
                         logger.error("Pairwise failed: %s", exc)
 
@@ -427,21 +453,37 @@ def cmd_ablation(args: argparse.Namespace) -> int:
         )
 
         comparisons = run_statistical_comparisons(
-            all_stats, baseline_pairs
+            all_stats, all_pairs
         )
 
-        # Get rankings from DB
+        # Get run-level rankings from DB and aggregate to config-level
         rankings = {}
-        bt = db.get_rankings("bradley_terry")
-        if bt:
-            rankings["Bradley-Terry"] = {
-                r["run_label"]: r["strength_score"] for r in bt
-            }
-        elo = db.get_rankings("elo")
-        if elo:
-            rankings["Elo"] = {
-                r["run_label"]: r["strength_score"] for r in elo
-            }
+        bt_raw = db.get_rankings("bradley_terry")
+        if bt_raw:
+            bt_run_scores = {r["run_label"]: r["strength_score"] for r in bt_raw}
+            rankings["Bradley-Terry"] = aggregate_rankings_by_config(
+                bt_run_scores, runs
+            )
+        elo_raw = db.get_rankings("elo")
+        if elo_raw:
+            elo_run_scores = {r["run_label"]: r["strength_score"] for r in elo_raw}
+            rankings["Elo"] = aggregate_rankings_by_config(
+                elo_run_scores, runs
+            )
+
+        # Collect deterministic gate metrics (cleaning & analysis only)
+        gate_stats = collect_gate_metrics(db, groups)
+        # Cross-validation structural quality proxy
+        cv_structural = collect_cv_structural_metrics(db, groups)
+        # Cross-dataset correlation using per-dataset judgments
+        corr = cross_wp_correlation_from_judgments(
+            db, groups, metric_name="overall"
+        )
+        # Per-dataset and per-judge breakdowns
+        per_dataset = collect_per_dataset_scores(db, groups)
+        per_judge = collect_per_judge_scores(db, groups)
+        # Inter-judge agreement
+        judge_agreement = collect_judge_agreement(db, groups)
 
         # Store stats in DB
         for label, metrics in all_stats.items():
@@ -475,12 +517,20 @@ def cmd_ablation(args: argparse.Namespace) -> int:
     report_path = generate_ablation_report(
         baseline, all_stats, comparisons,
         rankings if rankings else None, output_dir,
+        gate_stats=gate_stats or None,
+        cross_wp_corr=corr or None,
+        cv_structural=cv_structural or None,
+        per_dataset_scores=per_dataset or None,
+        per_judge_scores=per_judge or None,
+        judge_agreement=judge_agreement or None,
     )
 
     # Generate figures
     generate_all_figures(
         all_stats, config_scores, comparisons,
         rankings if rankings else None, output_dir,
+        gate_stats=gate_stats or None,
+        judge_agreement=judge_agreement or None,
     )
 
     # Generate LaTeX exports
@@ -641,6 +691,88 @@ def _export_json(
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def cmd_deterministic(args: argparse.Namespace) -> int:
+    """Ingest deterministic metrics (gate scores, report metrics) for all runs.
+
+    Scans debug/ directories for __gate.json and __verdict.json files and
+    computes data_coverage_rate, figure_reference_rate, and
+    quantitative_grounding_rate for each report.  Idempotent.
+    """
+    config = load_config(args.config)
+    runs = _resolve_runs(args)
+    if not runs:
+        print("No runs found.", file=sys.stderr)
+        return 1
+
+    print(f"Ingesting deterministic metrics for {len(runs)} run(s)...")
+
+    with EvalDB(config.evaluation_db_path) as db:
+        _register_runs(db, runs)
+        for run in runs:
+            print(f"  {run.run_id}...")
+            ingest_run_deterministic(run, db)
+
+    print("Deterministic ingestion complete.")
+    return 0
+
+
+def cmd_repeatability(args: argparse.Namespace) -> int:
+    """Print a repeatability (CoV) table for all configurations and metrics."""
+    from .statistics import coefficient_of_variation
+
+    config = load_config(args.config)
+
+    with EvalDB(config.evaluation_db_path) as db:
+        rep_stats = db.get_replication_stats()
+
+    if not rep_stats:
+        print("No replication stats found. Run 'ablation' command first.",
+              file=sys.stderr)
+        return 1
+
+    # Group by (config_label, metric_name)
+    from collections import defaultdict
+    grouped: Dict[str, Dict[str, Any]] = defaultdict(dict)
+    for row in rep_stats:
+        grouped[row["config_label"]][row["metric_name"]] = row
+
+    # Determine metric order
+    all_metrics: List[str] = sorted(
+        {row["metric_name"] for row in rep_stats}
+    )
+
+    print(f"\n{'Metric':<32} {'Config':<24} {'Mean':>7} {'Std':>7} "
+          f"{'CoV':>7} {'Stable?':<10}")
+    print("-" * 90)
+
+    for metric in all_metrics:
+        for label in sorted(grouped.keys()):
+            row = grouped[label].get(metric)
+            if row is None:
+                continue
+            mean = row["mean_val"] or 0.0
+            std = row["std_val"] or 0.0
+            # Reconstruct values list for CoV — approximate from std/mean
+            # (exact values not stored, use std/mean ratio directly)
+            if mean != 0 and std is not None:
+                cov = round(std / mean, 4)
+                stable = (
+                    "Yes" if cov < 0.15
+                    else "Moderate" if cov < 0.25
+                    else "No"
+                )
+                cov_str = f"{cov:.3f}"
+            else:
+                cov_str = "N/A"
+                stable = "—"
+            print(
+                f"{metric:<32} {label:<24} {mean:>7.3f} {std:>7.3f} "
+                f"{cov_str:>7} {stable:<10}"
+            )
+
+    return 0
+
+
 def cmd_rankings(args: argparse.Namespace) -> int:
     """Show current configuration rankings."""
     config = load_config(args.config)
@@ -675,6 +807,12 @@ def cmd_full(args: argparse.Namespace) -> int:
     print("=" * 60)
     print("FULL EVALUATION PIPELINE")
     print("=" * 60)
+
+    # Step 0: Ingest deterministic metrics (gate scores, report metrics)
+    print("\n--- Step 0: Deterministic Metric Ingestion ---")
+    ret = cmd_deterministic(args)
+    if ret != 0:
+        print("  (deterministic ingestion failed — continuing anyway)")
 
     # Step 1: Evaluate
     print("\n--- Step 1: LLM-as-Judge Evaluation ---")
@@ -764,6 +902,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     exp_p.add_argument("--output-dir")
 
+    # deterministic
+    det_p = subparsers.add_parser(
+        "deterministic",
+        help="Ingest gate scores and report metrics (no LLM calls)",
+    )
+    det_p.add_argument("run_dirs", nargs="*")
+    det_p.add_argument("--glob", "-g")
+
+    # repeatability
+    subparsers.add_parser(
+        "repeatability",
+        help="Print CoV repeatability table for all configurations",
+    )
+
     # rankings
     rank_p = subparsers.add_parser(
         "rankings", help="Show configuration rankings"
@@ -804,6 +956,8 @@ def main() -> int:
         "ablation": cmd_ablation,
         "export": cmd_export,
         "rankings": cmd_rankings,
+        "deterministic": cmd_deterministic,
+        "repeatability": cmd_repeatability,
         "full": cmd_full,
     }
 

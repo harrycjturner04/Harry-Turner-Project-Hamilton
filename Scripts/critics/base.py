@@ -54,6 +54,17 @@ class CriticContext:
     # Tracking — mutated by the dispatch loop to record which critics ran
     evaluators_ran: Dict[str, bool] = field(default_factory=dict)
 
+    # Plots that have exhausted fix attempts and must not be re-evaluated.
+    # Populated by _fix_plots() and carried across loop iterations so the
+    # VLM does not re-flag unfixable plots on every subsequent pass.
+    exhausted_plots: Set[str] = field(default_factory=set)
+
+    # Previous content evaluation results — used by the content evaluator
+    # for reference-anchored evaluation (monotonic evaluation pressure).
+    # When non-empty, the evaluator is instructed to only fail criteria
+    # that previously passed if the current output is genuinely worse.
+    previous_content_checks: List[Any] = field(default_factory=list)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # CriticModule ABC

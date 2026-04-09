@@ -32,7 +32,7 @@ import time
 import yaml
 import httpx
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 class PipelineMode(enum.Enum):
@@ -90,6 +90,7 @@ from prompts import (
     CLEANING_RUBRIC,
     ANALYSIS_RUBRIC,
     CROSS_VALIDATION_RUBRIC,
+    REPORT_RUBRIC,
     V2_INTERPRETATION_BLOCK,
     V2_PVALUE_BLOCK,
     V3_INTERPRETATION_BLOCK,
@@ -125,6 +126,7 @@ from tools import (
     check_to_dict,
     verdict_to_dict,
     gate_to_dict,
+    finding_text,
 )
 from context_parser import parse_context, RunPlan, RunConfig, QualitySpec, StageSpec
 from schema_profiler import profile_dataset, save_profile, build_profile_instructions, DataProfile
@@ -1128,24 +1130,43 @@ class _ExpertCallBudget:
 
     STAGE_BUDGETS: Dict[str, int] = {
         "cleaning": 2,
-        "analysis": 6,  # four-pass strategy (plan + review + execute + reflect) + retry headroom
+        "analysis": 9,  # five-pass strategy (plan + review + execute + model + reflect) + retry headroom
         "cross_validation": 3,  # dynamic domain check needs more calls
         "report": 2,
     }
     DEFAULT = 2
 
+    # Maximum no-code calls before forcing coding back on.  The five-pass
+    # strategy expects exactly 2 no-code passes (plan + review); after that,
+    # code execution MUST be available even if the LLM keeps using a
+    # group_name containing 'plan' or 'review'.
+    MAX_NO_CODE_CALLS = 2
+
     def __init__(self) -> None:
         self._stage = ""
         self._count = 0
+        self._no_code_count = 0
         self._budget_override: Optional[int] = None
 
     def reset(self, stage: str, budget_override: Optional[int] = None) -> None:
         self._stage = stage
         self._count = 0
+        self._no_code_count = 0
         self._budget_override = budget_override
         effective = budget_override or self.STAGE_BUDGETS.get(stage, self.DEFAULT)
         logger.info("Expert call budget reset for stage '%s' (max %d)",
                      stage, effective)
+
+    def record_no_code_call(self) -> None:
+        """Record that a call was made with coding disabled."""
+        self._no_code_count += 1
+
+    def should_force_coding(self) -> bool:
+        """Return True if we've exhausted the no-code allowance and must
+        force coding on regardless of group_name keywords.
+        Note: record_no_code_call() is called BEFORE this check, so we
+        use > (not >=) to allow exactly MAX_NO_CODE_CALLS no-code calls."""
+        return self._no_code_count > self.MAX_NO_CODE_CALLS
 
     def try_call(self) -> tuple:
         """Check budget before a seek_experts_help call.
@@ -1168,7 +1189,11 @@ class _ExpertCallBudget:
         return True, ""
 
 
-def _patch_seek_experts_on_agent(agent: Any, budget: _ExpertCallBudget) -> bool:
+def _patch_seek_experts_on_agent(
+    agent: Any,
+    budget: _ExpertCallBudget,
+    pipeline: Any = None,
+) -> bool:
     """Wrap seek_experts_help in an agent's _function_map with budget checking.
 
     Searches the agent and its sub-agents for the _function_map entry.
@@ -1179,6 +1204,10 @@ def _patch_seek_experts_on_agent(agent: Any, budget: _ExpertCallBudget) -> bool:
     execution should be possible).  The ``Computer_terminal`` agent is only
     added by AutoBuild when ``coding=True``, so toggling it before the call
     prevents any agent in the GroupChat from executing code.
+
+    When *pipeline* is provided, the wrapper also swaps the agent library
+    per-pass so that MODEL passes use only ml_modeler while REVIEW, EXECUTE,
+    and REFLECT passes exclude ml_modeler entirely.
     """
     patched = False
 
@@ -1203,9 +1232,25 @@ def _patch_seek_experts_on_agent(agent: Any, budget: _ExpertCallBudget) -> bool:
 
             # ── Per-call coding toggle (Fix A) ──
             # Detect plan-only or review-only passes by group_name convention
-            # and disable code execution for those calls.
+            # and disable code execution for those calls.  However, once the
+            # budget's no-code allowance is exhausted (default: 2 calls), we
+            # force coding back on so the analysis can produce artifacts even
+            # if the LLM keeps reusing a 'plan' group_name.
             _group = kwargs.get("group_name", "")
-            _no_code = any(kw in _group.lower() for kw in ("plan", "review"))
+            _wants_no_code = any(kw in _group.lower() for kw in ("plan", "review"))
+            # Record no-code INTENT before checking config — ensures the
+            # force-coding guard fires even when _nested_config resolution
+            # fails or the executor changes between calls.
+            if _wants_no_code:
+                budget.record_no_code_call()
+            _force_coding = budget.should_force_coding()
+            _no_code = _wants_no_code and not _force_coding
+            if _wants_no_code and _force_coding:
+                logger.warning(
+                    "No-code allowance exhausted (%d/%d calls) — forcing "
+                    "coding=True despite group_name=%r",
+                    budget._no_code_count, budget.MAX_NO_CODE_CALLS, _group,
+                )
             _nc = getattr(_executor_ref, "_nested_config", None)
             _prev_coding = True
             if _no_code and isinstance(_nc, dict):
@@ -1215,8 +1260,56 @@ def _patch_seek_experts_on_agent(agent: Any, budget: _ExpertCallBudget) -> bool:
                     _build_cfg["coding"] = False
                     logger.info(
                         "Disabled coding for seek_experts_help call "
-                        "(group_name=%r) — no Computer_terminal", _group,
+                        "(group_name=%r, no_code_count=%d) — no Computer_terminal",
+                        _group, budget._no_code_count,
                     )
+                else:
+                    logger.warning(
+                        "autobuild_build_config is not a dict (%s) — "
+                        "cannot toggle coding for group_name=%r",
+                        type(_build_cfg).__name__, _group,
+                    )
+            elif _no_code:
+                logger.warning(
+                    "_nested_config not available (type=%s) — "
+                    "cannot toggle coding for group_name=%r",
+                    type(_nc).__name__, _group,
+                )
+
+            # ── Per-call agent library filtering (MODEL pass isolation) ──
+            # Swap the AutoBuild library so that:
+            #   - MODEL passes ('model' in group_name) use ONLY ml_modeler
+            #   - REVIEW/EXECUTE/REFLECT passes EXCLUDE ml_modeler
+            #   - PLAN passes keep the full library (planner is selected by
+            #     text instruction, not library filtering)
+            _prev_lib: Optional[str] = None
+            _group_lower = _group.lower()
+            if pipeline is not None and isinstance(_nc, dict):
+                _build_cfg = _nc.get("autobuild_build_config")
+                if isinstance(_build_cfg, dict):
+                    _prev_lib = _build_cfg.get("library_path_or_json")
+                    if "model" in _group_lower and "review" not in _group_lower:
+                        # MODEL pass — ml_modeler only
+                        _filtered_path = pipeline._write_filtered_agent_library(
+                            include_names=["ml_modeler"],
+                        )
+                        _build_cfg["library_path_or_json"] = str(_filtered_path)
+                        logger.info(
+                            "MODEL pass: swapped agent library to ml_modeler-only "
+                            "(group_name=%r)",
+                            _group,
+                        )
+                    elif not any(kw in _group_lower for kw in ("plan",)):
+                        # REVIEW / EXECUTE / REFLECT — exclude ml_modeler
+                        _filtered_path = pipeline._write_filtered_agent_library(
+                            exclude_names=["ml_modeler"],
+                        )
+                        _build_cfg["library_path_or_json"] = str(_filtered_path)
+                        logger.info(
+                            "Non-model pass: swapped agent library to exclude "
+                            "ml_modeler (group_name=%r)",
+                            _group,
+                        )
 
             try:
                 result = original_fn(**kwargs)
@@ -1237,6 +1330,11 @@ def _patch_seek_experts_on_agent(agent: Any, budget: _ExpertCallBudget) -> bool:
                     _build_cfg = _nc.get("autobuild_build_config")
                     if isinstance(_build_cfg, dict):
                         _build_cfg["coding"] = _prev_coding
+                # Restore original agent library for subsequent calls
+                if _prev_lib is not None and isinstance(_nc, dict):
+                    _build_cfg = _nc.get("autobuild_build_config")
+                    if isinstance(_build_cfg, dict):
+                        _build_cfg["library_path_or_json"] = _prev_lib
 
             return result
         return _budgeted
@@ -1783,6 +1881,84 @@ _PROMPT_REGISTRY: Dict[str, str] = {
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Parameters file loading helper
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _load_parameters_summary(path: Path) -> Tuple[str, Dict[str, Any]]:
+    """Load a supplementary parameters/metadata file and return a compact summary.
+
+    Supports .xlsx/.xls (via openpyxl/xlrd), .csv, and plain text.
+    Returns a compact text representation suitable for injection into agent prompts.
+    Never raises — returns an empty string on failure.
+    """
+    try:
+        import pandas as _pd_params
+        suffix = path.suffix.lower()
+        if suffix in (".xlsx", ".xls"):
+            df = _pd_params.read_excel(path)
+        elif suffix == ".csv":
+            df = _pd_params.read_csv(path)
+        else:
+            # Plain text fallback — no condition_map derivable
+            return path.read_text(encoding="utf-8", errors="ignore")[:3000], {}
+
+        # Detect file format:
+        #   data-dictionary: 2 columns, first col all-unique non-numeric strings
+        #     → each row is a variable description; emit as "variable: description" pairs
+        #   run-conditions: first col is a run/experiment ID
+        #     → emit column summaries + build condition_map keyed by run ID
+        condition_map: Dict[str, Any] = {}
+        is_data_dict = (
+            len(df.columns) == 2
+            and df.iloc[:, 0].dropna().nunique() == len(df.iloc[:, 0].dropna())
+            and not _pd_params.api.types.is_numeric_dtype(df.iloc[:, 0])
+        )
+
+        if is_data_dict:
+            key_col, desc_col = df.columns[0], df.columns[1]
+            lines = [
+                f"Column descriptions from {path.name}:",
+                "",
+            ]
+            for _, row in df.iterrows():
+                key = row[key_col]
+                desc = row[desc_col]
+                if _pd_params.isna(key):
+                    continue
+                desc_str = "" if _pd_params.isna(desc) else str(desc).strip()
+                lines.append(f"  {key}: {desc_str}" if desc_str else f"  {key}: (no description)")
+        else:
+            lines = [
+                f"Parameters file: {path.name}",
+                f"Shape: {df.shape[0]} rows × {df.shape[1]} columns",
+                "",
+                "Columns and representative values:",
+            ]
+            for col in df.columns:
+                unique_vals = df[col].dropna().unique()
+                n_unique = len(unique_vals)
+                sample = list(unique_vals[:8])
+                suffix_str = ", ..." if n_unique > 8 else ""
+                lines.append(f"  {col!r}: {n_unique} unique — {sample}{suffix_str}")
+
+            # Build condition_map: first column assumed to be run/experiment ID
+            if len(df.columns) >= 2:
+                id_col = df.columns[0]
+                for _, row in df.iterrows():
+                    run_id = str(row[id_col])
+                    condition_map[run_id] = {
+                        str(c): str(row[c]) for c in df.columns[1:] if not _pd_params.isna(row[c])
+                    }
+
+        return "\n".join(lines), condition_map
+
+    except Exception as exc:
+        logger.warning("Failed to load parameters file %s: %s", path, exc)
+        return "", {}
+
+
+# ══════════════════════════════════════════════════════════════════════
 # CaptainPipeline
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1805,7 +1981,7 @@ class CaptainPipeline:
     _SENTINEL = object()
 
     # Per-stage max_round for GroupChat.  Analysis needs the most headroom
-    # because the three-pass strategy (planner → reviewer → executor) and the
+    # because the five-pass strategy (planner → reviewer → executor → modeler → reflector) and the
     # execution pass requires multiple code-execute-refine cycles.
     # Cleaning and report stages are simpler.
     _STAGE_MAX_ROUNDS: Dict[str, int] = {
@@ -1895,6 +2071,32 @@ class CaptainPipeline:
         self.context_bundle = load_context_text(context_path)
         if self.run_plan.project_description:
             self.context_bundle["context_text"] = self.run_plan.project_description
+
+        # Opportunistic parameters file injection (strictly optional and additive).
+        # If parameters_path is set in context.md constraints AND the file exists,
+        # load it and inject summary as metadata_context_text.  No-op otherwise.
+        _params_path_str = self.run_plan.global_constraints.parameters_path
+        self._condition_map: Dict[str, Any] = {}
+        if _params_path_str:
+            _params_file = Path(_params_path_str)
+            if not _params_file.is_absolute() and context_path is not None:
+                _params_file = context_path.parent / _params_path_str
+            if _params_file.exists():
+                _params_summary, self._condition_map = _load_parameters_summary(_params_file)
+                if _params_summary:
+                    self.context_bundle["metadata_context_text"] = _params_summary
+                    self.context_bundle["experimental_conditions"] = self._condition_map
+                    logger.info(
+                        "Parameters file loaded: %s (%d chars, %d run conditions)",
+                        _params_file, len(_params_summary), len(self._condition_map),
+                    )
+            else:
+                logger.info(
+                    "parameters_path set to '%s' but file not found — "
+                    "proceeding without parameters metadata",
+                    _params_path_str,
+                )
+
         self.outputs_root.mkdir(parents=True, exist_ok=True)
         self.debug_root = self.outputs_root / "debug"
         self.debug_root.mkdir(parents=True, exist_ok=True)
@@ -1981,7 +2183,7 @@ class CaptainPipeline:
 
         # ---- Expert call budget ----
         self._expert_budget = _ExpertCallBudget()
-        if not _patch_seek_experts_on_agent(self.captain, self._expert_budget):
+        if not _patch_seek_experts_on_agent(self.captain, self._expert_budget, pipeline=self):
             logger.warning(
                 "Could not patch seek_experts_help budget on captain — "
                 "budget enforcement will not be active"
@@ -2138,10 +2340,15 @@ class CaptainPipeline:
 
     @staticmethod
     def _context_fields(context_payload: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        fields: Dict[str, Any] = {
             "metadata_context_text": context_payload.get("metadata_context_text", ""),
             "context_text": context_payload.get("context_text", ""),
         }
+        # Inject experimental_conditions when parameters file was loaded (optional)
+        exp_cond = context_payload.get("experimental_conditions")
+        if exp_cond:
+            fields["experimental_conditions"] = exp_cond
+        return fields
 
     def _get_stage_spec(self, stage_name: str) -> Optional[StageSpec]:
         """Look up a StageSpec by name from the RunPlan."""
@@ -2467,6 +2674,36 @@ class CaptainPipeline:
              "description": s.get("description", "")}
             for s in self.agent_specs
         ]
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    def _write_filtered_agent_library(
+        self,
+        include_names: Optional[List[str]] = None,
+        exclude_names: Optional[List[str]] = None,
+    ) -> Path:
+        """Write a filtered agent library JSON for per-pass agent control.
+
+        Args:
+            include_names: If set, only include agents with these names.
+            exclude_names: If set, exclude agents with these names.
+                           Ignored when *include_names* is provided.
+
+        Returns:
+            Path to the written filtered library file.
+        """
+        specs = list(self.agent_specs)
+        if include_names is not None:
+            specs = [s for s in specs if s["name"] in include_names]
+        elif exclude_names is not None:
+            specs = [s for s in specs if s["name"] not in exclude_names]
+        payload = [
+            {"name": s["name"], "system_message": s["system_message"],
+             "description": s.get("description", "")}
+            for s in specs
+        ]
+        names_tag = "_".join(sorted(s["name"] for s in specs))[:80]
+        path = self.outputs_root / f"agent_library_{names_tag}.json"
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path
 
@@ -3262,6 +3499,7 @@ class CaptainPipeline:
         "cleaning": CLEANING_RUBRIC,
         "analysis": ANALYSIS_RUBRIC,
         "cross_validation": CROSS_VALIDATION_RUBRIC,
+        "report": REPORT_RUBRIC,  # WP-R3
     }
 
     def _run_content_evaluator(
@@ -3269,6 +3507,7 @@ class CaptainPipeline:
         stage_name: str,
         artifacts_summary: str,
         label: str,
+        previous_content_checks: Optional[List[CheckResult]] = None,
     ) -> List[CheckResult]:
         """Evaluate stage output quality via direct LLM call (content evaluator).
 
@@ -3302,8 +3541,37 @@ class CaptainPipeline:
         )
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": artifacts_summary[:10000]},
         ]
+
+        # ── Reference-anchored evaluation ──
+        # When previous content checks exist, inject them as context so the
+        # evaluator maintains monotonic evaluation pressure.  This prevents
+        # the "whack-a-mole" pattern where fixing one criterion causes a
+        # previously-passing criterion to regress.
+        if previous_content_checks:
+            _prev_passed = [
+                c for c in previous_content_checks
+                if c.passed and c.category == CheckCategory.CONTENT_QUALITY
+            ]
+            if _prev_passed:
+                _anchor_lines = []
+                for c in _prev_passed:
+                    _anchor_lines.append(f"  - {c.name}: PASSED ({c.detail[:120]})")
+                _anchor_text = (
+                    "REFERENCE ANCHOR — Previous attempt evaluation:\n"
+                    "The following criteria PASSED in the previous attempt:\n"
+                    + "\n".join(_anchor_lines) + "\n\n"
+                    "IMPORTANT: Only fail a previously-passing criterion if "
+                    "the current output is GENUINELY WORSE on that specific "
+                    "dimension compared to the previous attempt. Do not fail "
+                    "a criterion just because the analysis approach changed — "
+                    "evaluate whether the current output still meets the "
+                    "criterion's requirements on its own merits. If the quality "
+                    "is comparable or better, it should still pass."
+                )
+                messages.append({"role": "user", "content": _anchor_text})
+
+        messages.append({"role": "user", "content": artifacts_summary[:10000]})
         try:
             if self._critic_client is not None:
                 response = self._critic_client.chat.completions.create(
@@ -3495,6 +3763,140 @@ class CaptainPipeline:
                 })
         return items
 
+    def _inject_figure_refs(
+        self,
+        payload: Dict[str, Any],
+        listing: List[Dict[str, Any]],
+    ) -> None:
+        """Inject missing 'figure_ref' keys into analysis findings.
+
+        Runs before critic dispatch so the figure_references structural check
+        and exec__plot_finding_alignment always see a fully-annotated summary.
+
+        Two-pass strategy so every PNG is assigned regardless of token overlap:
+
+        Pass 1 — Token overlap: for each finding without a figure_ref, match
+          to the highest-scoring PNG whose stem shares ≥1 meaningful token
+          (length > 3) with the finding text.
+
+        Pass 2 — Fallback: for any PNG still unreferenced after Pass 1, assign
+          it to the longest finding that has no figure_ref.  This handles plots
+          whose stems share no vocabulary with any finding text.
+
+        String findings are normalised to ``{"text": f}`` dicts before matching
+        so figure_ref can be added (the LLM sometimes emits bare strings).
+        """
+        asp = payload.get("analysis_summary_path", "")
+        if not asp or not Path(asp).exists():
+            return
+
+        pngs = [
+            Path(f["path"]).name
+            for f in listing
+            if isinstance(f, dict)
+            and isinstance(f.get("path"), str)
+            and f["path"].lower().endswith(".png")
+            and Path(f["path"]).exists()
+        ]
+        if not pngs:
+            return
+
+        try:
+            raw = Path(asp).read_text("utf-8")
+            summary = json.loads(raw)
+        except Exception:
+            return
+
+        findings = summary.get("findings", [])
+        if not findings:
+            return
+
+        # Normalise string findings to dicts so figure_ref can be set.
+        modified = False
+        for i, f in enumerate(findings):
+            if isinstance(f, str):
+                findings[i] = {"text": f}
+                modified = True  # mark modified so normalised form is written back
+
+        # ── Pass 1: Token-overlap matching ──
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            if finding.get("figure_ref") or finding.get("figure"):
+                continue  # already annotated
+            f_text = finding.get("text", "").lower()
+            if not f_text:
+                continue
+
+            best_png: Optional[str] = None
+            best_score = 0
+            for png in pngs:
+                stem_tokens = set(
+                    Path(png).stem.lower().replace("-", "_").split("_")
+                )
+                # Only count tokens longer than 3 chars to avoid noise from
+                # short words like "by", "of", "per"
+                overlap = sum(
+                    1 for t in stem_tokens
+                    if len(t) > 3 and t in f_text
+                )
+                if overlap > best_score:
+                    best_score = overlap
+                    best_png = png
+
+            if best_png and best_score >= 1:
+                finding["figure_ref"] = best_png
+                modified = True
+
+        # ── Pass 2: Fallback — assign any still-unreferenced PNG to the
+        # longest finding that has no figure_ref yet.  This prevents
+        # exec__plot_finding_alignment from firing on plots that happen to
+        # share no vocabulary with any finding text, breaking the oscillation
+        # cycle where alignment failures force a full captain rerun that then
+        # regenerates a summary with the same vocabulary gap.
+        _referenced: Set[str] = set()
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            ref = f.get("figure_ref") or f.get("figure") or ""
+            if ref:
+                _referenced.add(ref)
+            # Also treat inline mentions in text as references
+            f_lower = f.get("text", "").lower()
+            for png in pngs:
+                if Path(png).stem.lower() in f_lower or png.lower() in f_lower:
+                    _referenced.add(png)
+
+        _unreferenced = [p for p in pngs if p not in _referenced]
+        for png in _unreferenced:
+            best_idx = -1
+            best_len = 0
+            for idx, f in enumerate(findings):
+                if not isinstance(f, dict):
+                    continue
+                if f.get("figure_ref") or f.get("figure"):
+                    continue  # already assigned
+                f_len = len(f.get("text", ""))
+                if f_len > best_len:
+                    best_len = f_len
+                    best_idx = idx
+            if best_idx >= 0:
+                findings[best_idx]["figure_ref"] = png
+                modified = True
+                logger.debug(
+                    "figure_ref fallback: assigned %s to finding[%d] (no token overlap)",
+                    png, best_idx,
+                )
+
+        if modified:
+            summary["findings"] = findings
+            try:
+                Path(asp).write_text(
+                    json.dumps(summary, indent=2, default=str), "utf-8"
+                )
+            except Exception as exc:
+                logger.debug("figure_ref injection write failed: %s", exc)
+
     def _build_critic_input(
         self,
         stage_name: str,
@@ -3651,6 +4053,8 @@ class CaptainPipeline:
         previous_verdict: Optional[StageVerdict] = None
         skip_stage_execution = False
         _stall_count = 0  # consecutive identical must-fix sets
+        _exhausted_plots: Set[str] = set()  # plots that consumed fix budget — skip VLM
+        _sub_iter_count = 0  # consecutive skip_stage_execution=True iterations
 
         # WP-2: Convergence control
         _strategy = self.run_config.iteration_strategy
@@ -3668,8 +4072,32 @@ class CaptainPipeline:
         if _strategy == "none":
             max_retries = 0
 
+        listing: List[Dict[str, Any]] = []  # populated at start of each iteration
+
         while True:
             lbl = stage_label if attempts == 0 else f"{stage_label}__retry{attempts}"
+
+            # ── Sub-iteration cap ──
+            # Targeted fixes (plot-fix, alignment-fix, etc.) set
+            # skip_stage_execution=True and re-evaluate without calling the
+            # captain.  If they cycle without resolving the issue, `attempts`
+            # never advances so the max-retries check never fires.  Cap
+            # consecutive sub-iterations and force a full captain rerun when
+            # the limit is reached, guaranteeing forward progress.
+            _max_sub_iters = max(max_retries, 3)
+            if skip_stage_execution:
+                _sub_iter_count += 1
+                if _sub_iter_count >= _max_sub_iters:
+                    logger.warning(
+                        "%s: sub-iteration cap (%d) reached — forcing full "
+                        "captain rerun to break cycle",
+                        lbl, _max_sub_iters,
+                    )
+                    attempts += 1  # count toward max_retries so budget is consumed
+                    skip_stage_execution = False
+                    _sub_iter_count = 0
+            else:
+                _sub_iter_count = 0  # reset on any genuine captain run
 
             # ══════════════════════════════════════════════════════════
             # 1. EXECUTE STAGE (AG2 CaptainAgent call)
@@ -3680,11 +4108,87 @@ class CaptainPipeline:
             # genuine captain passes; counting re-evaluations after plot
             # deletions as "attempts" falsely exhausts the retry budget.
             _captain_ran_this_iteration = not skip_stage_execution
+            # Snapshot PNGs before captain runs so we can archive stale plots
+            # from previous attempts that the new run no longer generates.
+            _pre_run_pngs: Set[Path] = set()
+            if not skip_stage_execution and listing:
+                _pre_run_pngs = {
+                    Path(f["path"])
+                    for f in listing
+                    if isinstance(f, dict)
+                    and str(f.get("path", "")).endswith(".png")
+                    and Path(f["path"]).exists()
+                }
             if not skip_stage_execution:
                 stage_reply = self._run_with_captain(base_payload, None, lbl)
                 last_reply = stage_reply if isinstance(stage_reply, str) else str(stage_reply)
             skip_stage_execution = False  # reset for next iteration
             listing = self._list_output_dir(base_payload.get("output_dir"))
+
+            # ── Stale plot cleanup ──
+            # Any PNG that existed before the captain ran but is absent from
+            # the new listing was not regenerated.  Archive it so the exec
+            # critic doesn't demand it be referenced in the new findings.
+            if _pre_run_pngs:
+                _post_run_pngs = {
+                    Path(f["path"])
+                    for f in listing
+                    if isinstance(f, dict)
+                    and str(f.get("path", "")).endswith(".png")
+                }
+                _stale_pngs = _pre_run_pngs - _post_run_pngs
+                if _stale_pngs:
+                    for _sp in _stale_pngs:
+                        if _sp.exists():
+                            _sp.rename(_sp.with_suffix(".png.stale"))
+                            logger.info(
+                                "Archived stale plot not regenerated by retry: %s",
+                                _sp.name,
+                            )
+                    # Clear stale names from exhausted-plots set; the captain
+                    # may regenerate them fresh next attempt.
+                    _exhausted_plots -= {p.name for p in _stale_pngs}
+                    # Re-scan so critics don't see archived files
+                    listing = self._list_output_dir(base_payload.get("output_dir"))
+
+            # ── P3: Post-hoc figure_ref normalisation (analysis stage only) ──
+            # Findings that lack a 'figure_ref' key trigger the figure_references
+            # structural check every iteration because the LLM frequently omits it.
+            # As a best-effort fix, match each un-annotated finding to the most
+            # relevant PNG on disk by token overlap and inject the 'figure_ref' field.
+            # This runs BEFORE critics so the structural check sees the patched file.
+            if stage_name == "analysis":
+                self._inject_figure_refs(base_payload, listing)
+
+            # ── Finding deduplication ──
+            # The CaptainAgent sometimes produces duplicate findings (40-50%
+            # duplication rate observed in runs).  Deduplicate by text content
+            # before critics evaluate, to prevent inflated finding counts from
+            # confusing per-finding checks.
+            if stage_name == "analysis":
+                _asp = base_payload.get("analysis_summary_path", "")
+                if _asp and Path(_asp).exists():
+                    try:
+                        _as_data = json.loads(Path(_asp).read_text("utf-8"))
+                        _findings = _as_data.get("findings", [])
+                        if len(_findings) > 1:
+                            _seen_texts: set = set()
+                            _deduped: list = []
+                            for _f in _findings:
+                                _ft = finding_text(_f).strip()
+                                if _ft and _ft not in _seen_texts:
+                                    _seen_texts.add(_ft)
+                                    _deduped.append(_f)
+                            _removed = len(_findings) - len(_deduped)
+                            if _removed > 0:
+                                _as_data["findings"] = _deduped
+                                safe_write_json(Path(_asp), _as_data)
+                                logger.info(
+                                    "Deduplicated findings: removed %d/%d duplicates",
+                                    _removed, len(_findings),
+                                )
+                    except Exception as _exc:
+                        logger.debug("Finding dedup skipped: %s", _exc)
 
             # ── Conversation-summary short-circuit ──
             # If CaptainAgent returned a summary/TERMINATE but artifacts exist
@@ -3719,6 +4223,11 @@ class CaptainPipeline:
                 debug_root=self.debug_root,
                 llm_client=None,   # ContentCritic delegates to pipeline methods
                 vlm_client=None,   # VisualCritic delegates to pipeline methods
+                exhausted_plots=set(_exhausted_plots),  # carry across iterations
+                previous_content_checks=(
+                    previous_verdict.content_checks
+                    if previous_verdict is not None else []
+                ),
             )
             verdict = self._critic_registry.dispatch(_critic_ctx)
             verdict.attempt = attempts  # ensure attempt is set
@@ -3745,9 +4254,79 @@ class CaptainPipeline:
                 ),
                 stall_count=_stall_count,
                 issue_stall_max_consecutive=getattr(
-                    self.run_config, "issue_stall_max_consecutive", 4,
+                    self.run_config, "issue_stall_max_consecutive", 2,
                 ),
             )
+            # ── Check regression logging ──
+            # Compare current verdict against previous to log checks that
+            # regressed (were passing, now failing) alongside checks that
+            # improved (were failing, now passing).
+            if previous_verdict is not None:
+                _prev_all = (previous_verdict.structural_checks + previous_verdict.content_checks
+                             + previous_verdict.plot_checks + previous_verdict.claim_checks)
+                _curr_all = (verdict.structural_checks + verdict.content_checks
+                             + verdict.plot_checks + verdict.claim_checks)
+                _prev_passed = {c.name for c in _prev_all if c.passed}
+                _prev_failed = {c.name for c in _prev_all if not c.passed}
+                _curr_passed = {c.name for c in _curr_all if c.passed}
+                _curr_failed = {c.name for c in _curr_all if not c.passed}
+                _regressed = _prev_passed & _curr_failed
+                _improved = _prev_failed & _curr_passed
+                if _regressed:
+                    logger.warning(
+                        "Check regressions (PASS→FAIL): %s", sorted(_regressed),
+                    )
+                if _improved:
+                    logger.info(
+                        "Check improvements (FAIL→PASS): %s", sorted(_improved),
+                    )
+                if _regressed and len(_regressed) > len(_improved):
+                    logger.warning(
+                        "Net regression: %d checks regressed vs %d improved",
+                        len(_regressed), len(_improved),
+                    )
+
+            # ── Pass C: Artifact rollback on net regression ──
+            # When a full CaptainAgent retry causes net regression (more checks
+            # went PASS→FAIL than FAIL→PASS), restore the previous attempt's
+            # analysis_summary.json.  This prevents wholesale replacement from
+            # destroying passing content.  The restored artifact is re-evaluated
+            # on the next iteration so the loop can try a more targeted fix.
+            if (
+                gate.net_regression
+                and _captain_ran_this_iteration
+                and stage_name == "analysis"
+                and attempts >= 2
+            ):
+                _summary_key_rb = {
+                    "analysis": "analysis_summary_path",
+                }.get(stage_name, "")
+                _asp_rb = base_payload.get(_summary_key_rb, "")
+                _prev_backup = ""
+                if _asp_rb:
+                    _prev_backup = str(
+                        Path(_asp_rb).with_name(
+                            f"{Path(_asp_rb).stem}__attempt{attempts - 1}"
+                            f"{Path(_asp_rb).suffix}"
+                        )
+                    )
+                if _prev_backup and Path(_prev_backup).exists():
+                    import shutil
+                    shutil.copy2(_prev_backup, _asp_rb)
+                    logger.warning(
+                        "REGRESSION ROLLBACK: Restored %s from attempt %d backup "
+                        "(%d checks regressed: %s)",
+                        Path(_asp_rb).name, attempts - 1,
+                        len(gate.regressed_checks), gate.regressed_checks,
+                    )
+                    # Use the previous verdict for downstream decisions since
+                    # the current (regressed) output has been rolled back
+                    verdict = previous_verdict
+                    gate.warnings.append(
+                        f"Regression rollback: restored artifacts from attempt "
+                        f"{attempts - 1} ({len(gate.regressed_checks)} checks regressed)"
+                    )
+
             previous_verdict = verdict
 
             # WP-2: Track quality trajectory (enriched with issue names for
@@ -3774,6 +4353,18 @@ class CaptainPipeline:
             ])
             _quality_trajectory[-1]["plot_count"] = _plot_count
 
+            # Track findings count for explosion detection (analysis stage only)
+            _findings_count = 0
+            if stage_name == "analysis":
+                _asp_fc = base_payload.get("analysis_summary_path", "")
+                if _asp_fc and Path(_asp_fc).exists():
+                    try:
+                        _fc_data = json.loads(Path(_asp_fc).read_text("utf-8"))
+                        _findings_count = len(_fc_data.get("findings", []))
+                    except Exception:
+                        pass
+            _quality_trajectory[-1]["findings_count"] = _findings_count
+
             if self.debug_root:
                 safe_write_json(self.debug_root / f"{lbl}__verdict.json", verdict_to_dict(verdict))
                 safe_write_json(self.debug_root / f"{lbl}__gate.json", gate_to_dict(gate))
@@ -3785,8 +4376,9 @@ class CaptainPipeline:
                 _t2_issues = set(_quality_trajectory[-3].get("must_fix_names", []))
                 _t1_issues = set(_quality_trajectory[-2].get("must_fix_names", []))
                 _t0_issues = set(_quality_trajectory[-1].get("must_fix_names", []))
-                _reappeared = _t2_issues & _t0_issues - _t1_issues
-                if _reappeared and attempts >= 2:
+                _reappeared = (_t2_issues & _t0_issues) - _t1_issues
+                _osc_min = max(self.run_config.min_iterations - 1, 2)
+                if _reappeared and attempts >= _osc_min:
                     logger.warning(
                         "Oscillation detected: issues %s reappeared after fix — "
                         "accepting degraded", _reappeared,
@@ -3901,27 +4493,35 @@ class CaptainPipeline:
                         continue
 
                     if directive.scope == RefinementScope.PLOT_FIX:
-                        fixed = self._fix_plots(
+                        fixed, _newly_exhausted = self._fix_plots(
                             directive.check_results, base_payload, lbl,
                         )
+                        _exhausted_plots.update(_newly_exhausted)
+                        _critic_ctx.exhausted_plots.update(_newly_exhausted)
                         if fixed:
                             # Only treat plot fix as sufficient when there
                             # are no non-plot MUST_FIX failures outstanding.
-                            # Otherwise deletion-only fixes cause an
-                            # infinite critic→delete→critic loop because
-                            # content/depth issues are never addressed.
                             non_plot_mf = verdict.content_failures()
                             if non_plot_mf:
                                 logger.info(
                                     "Plot fix applied but %d non-plot "
                                     "MUST_FIX failure(s) remain — "
-                                    "falling through to full retry",
+                                    "continuing cascade",
                                     len(non_plot_mf),
                                 )
                             else:
                                 _targeted_fix_succeeded = True
                                 _quality_trajectory[-1]["refinement_scope_used"] = "plot_fix"
                                 break
+
+                    elif directive.scope == RefinementScope.ALIGNMENT_FIX:
+                        fixed = self._fix_plot_finding_alignment(
+                            directive.check_results, base_payload, listing, lbl,
+                        )
+                        if fixed:
+                            _targeted_fix_succeeded = True
+                            _quality_trajectory[-1]["refinement_scope_used"] = "alignment_fix"
+                            break
 
                     elif directive.scope == RefinementScope.FINDING_FIX:
                         fixed = self._fix_finding(directive, base_payload, lbl)
@@ -3947,9 +4547,11 @@ class CaptainPipeline:
 
             # Fallback: existing plot_fix path (when targeted_refinement is disabled)
             if not _targeted_refinement and gate.retry_tier == "plot_fix":
-                fixed = self._fix_plots(
+                fixed, _newly_exhausted = self._fix_plots(
                     verdict.plot_only_failures(), base_payload, lbl,
                 )
+                _exhausted_plots.update(_newly_exhausted)
+                _critic_ctx.exhausted_plots.update(_newly_exhausted)
                 if fixed:
                     # Same guard: only skip full retry when plot-only
                     # MUST_FIX issues are all that remain.
@@ -4043,6 +4645,25 @@ class CaptainPipeline:
             attempts += 1
             base_payload = dict(base_payload)
 
+            # Pass C: When the previous retry caused net regression, prepend
+            # a strong instruction to make only surgical changes.
+            _regression_prefix = ""
+            if gate.net_regression:
+                _regression_prefix = (
+                    "═══════════════════════════════════════════════\n"
+                    "WARNING — PREVIOUS RETRY CAUSED REGRESSION\n"
+                    "═══════════════════════════════════════════════\n"
+                    "Your previous rewrite BROKE checks that were passing.\n"
+                    f"Regressed checks: {', '.join(gate.regressed_checks)}\n\n"
+                    "CRITICAL RULES FOR THIS RETRY:\n"
+                    "1. Do NOT rewrite the entire analysis. Make SURGICAL fixes only.\n"
+                    "2. Read the existing analysis_summary.json FIRST.\n"
+                    "3. PRESERVE all existing findings, plots, and per_group entries.\n"
+                    "4. Only ADD or MODIFY the specific items that address the failing checks.\n"
+                    "5. Do NOT delete, reorder, or rephrase content that was not flagged.\n"
+                    "═══════════════════════════════════════════════\n\n"
+                )
+
             # Priority 1C: when grouping_adequacy has persisted >=2 iterations,
             # prepend a CRITICAL OVERRIDE block so it leads the retry instructions
             # rather than being buried at the end.
@@ -4059,6 +4680,53 @@ class CaptainPipeline:
                     None,
                 )
                 _dim_detail = _ga_check_override.detail if _ga_check_override else ""
+
+                # Extract actual missing dimension names from the detail string.
+                # Structural check detail format: "... not covered: name [purpose, N levels], ..."
+                _missing_dim_names: List[str] = []
+                if "not covered: " in _dim_detail:
+                    _covered_text = _dim_detail.split("not covered: ", 1)[1]
+                    # Strip trailing sentence
+                    _covered_text = _covered_text.split(". A secondary")[0].split(". Consider")[0]
+                    for _part in _covered_text.split("],"):
+                        _part = _part.strip().lstrip(",").strip()
+                        if " [" in _part:
+                            _missing_dim_names.append(_part.split(" [")[0].strip())
+                        elif _part:
+                            _missing_dim_names.append(_part.strip())
+
+                # Build a concrete JSON template using the actual dimension names
+                # so the agent knows exactly which key names to use.
+                if _missing_dim_names:
+                    _sa_entries = "".join(
+                        f'    "{dname}": {{\n'
+                        f'      "grouping_by": "{dname}",\n'
+                        f'      "summary": "summary of {dname} analysis",\n'
+                        f'      "key_findings": ["<finding 1 for {dname}>", "<finding 2>"]\n'
+                        f'    }},\n'
+                        for dname in _missing_dim_names[:3]
+                    )
+                    _concrete_json = (
+                        "{\n"
+                        "  \"secondary_analysis\": {\n"
+                        + _sa_entries
+                        + "  }\n}"
+                    )
+                    _key_names_str = ", ".join(f'"{n}"' for n in _missing_dim_names[:3])
+                else:
+                    _concrete_json = (
+                        "{\n"
+                        "  \"secondary_analysis\": {\n"
+                        "    \"<dimension_name>\": {\n"
+                        "      \"grouping_by\": \"<column>\",\n"
+                        "      \"summary\": \"one-sentence summary\",\n"
+                        "      \"key_findings\": [\"finding 1\", \"finding 2\"]\n"
+                        "    }\n"
+                        "  }\n"
+                        "}"
+                    )
+                    _key_names_str = "<dimension_name>"
+
                 _grouping_override = (
                     "═══════════════════════════════════════════════\n"
                     "CRITICAL OVERRIDE — PRIMARY TASK FOR THIS RETRY\n"
@@ -4066,20 +4734,16 @@ class CaptainPipeline:
                     "The grouping_adequacy issue has failed across multiple consecutive attempts.\n"
                     "Your PRIMARY task is to add a 'secondary_analysis' key to analysis_summary.json.\n"
                     f"Missing dimensions: {_dim_detail}\n\n"
-                    "Required addition to analysis_summary.json:\n"
-                    "{\n"
-                    "  \"secondary_analysis\": {\n"
-                    "    \"<dimension_name>\": {\n"
-                    "      \"grouping_by\": \"<column>\",\n"
-                    "      \"summary\": \"one-sentence summary\",\n"
-                    "      \"key_findings\": [\"finding 1\", \"finding 2\"]\n"
-                    "    }\n"
-                    "  }\n"
-                    "}\n\n"
+                    "Required addition to analysis_summary.json — copy this structure EXACTLY:\n"
+                    f"{_concrete_json}\n\n"
+                    f"CRITICAL: The top-level keys inside 'secondary_analysis' MUST be named "
+                    f"exactly: {_key_names_str}. "
+                    "Do NOT use generic names like 'additional', 'secondary', or 'other'.\n"
+                    "Use the dimension column names shown above.\n\n"
                     "Preserve ALL existing findings, plots, and per_group data.\n"
                     "═══════════════════════════════════════════════\n\n"
                 )
-            _retry_text = _grouping_override + gate.retry_instructions
+            _retry_text = _regression_prefix + _grouping_override + gate.retry_instructions
             # Reinforce grouping on analysis retries — include specific
             # dimension values when grouping_adequacy failed.
             if "analysis" in stage_label and self.grouping_columns:
@@ -4162,6 +4826,49 @@ class CaptainPipeline:
                 name for name, tracker in _issue_trackers.items()
                 if tracker.consecutive_count >= 2 and not tracker.resolved
             ]
+
+            # ── Targeted escalation for depth__missing_group_comparison ──
+            # When this check persists, the model likely ran a valid test but
+            # phrased the result in a way the keyword detector missed.  Inject
+            # the exact group names and show what a compliant finding looks like,
+            # so the model knows what text to produce rather than retrying blindly.
+            if "depth__missing_group_comparison" in _persistent:
+                _mgc_check = next(
+                    (c for c in verdict.must_fix_failures()
+                     if c.name == "depth__missing_group_comparison"),
+                    None,
+                )
+                # Extract group names from the check detail (populated by the critic)
+                _mgc_groups_hint = ""
+                if _mgc_check:
+                    _mgc_detail = _mgc_check.detail or ""
+                    # Detail format: "N groups present (G1, G2, ...) but no ..."
+                    _m = re.search(r"\(([^)]+)\)", _mgc_detail)
+                    if _m:
+                        _mgc_groups_hint = _m.group(1)
+                _group_example = _mgc_groups_hint or "Group_A, Group_B, ..."
+                _retry_text += (
+                    "\n\n════════════════════════════════════════\n"
+                    "PERSISTENT CHECK: depth__missing_group_comparison\n"
+                    "════════════════════════════════════════\n"
+                    "This check has failed multiple times. Your previous attempt likely "
+                    "performed the test but phrased the result in a way that was not "
+                    "detected. The check looks for these keywords/patterns in findings text:\n"
+                    "  • 't-test', 'ttest', 't_test', 'mann-whitney', 'wilcoxon'\n"
+                    "  • 'anova', 'kruskal', 'f_oneway'\n"
+                    "  • 'p-value', 'p_value', 'p value'\n"
+                    "  • p-value notation: 'p < 0.05', 'p=0.003' etc.\n"
+                    "  • 'statistically significant', 'effect size', 'cohen'\n"
+                    "  • 'across groups', 'between groups', 'among groups'\n\n"
+                    f"Groups to compare: {_group_example}\n\n"
+                    "Ensure at least ONE finding contains an explicit p-value result "
+                    "using one of the keywords above. Example compliant finding:\n"
+                    "  {\"text\": \"Kruskal-Wallis test across groups: H=12.3, p=0.002, "
+                    "indicating statistically significant differences.\", "
+                    "\"figure_ref\": \"group_comparison.png\"}\n"
+                    "════════════════════════════════════════\n"
+                )
+
             if _persistent:
                 _retry_text += (
                     "\n\nPERSISTENT ISSUES (failed >=2 consecutive attempts): "
@@ -4184,6 +4891,38 @@ class CaptainPipeline:
                         "issues. Preserve the existing set of plots — do not generate "
                         "new ones unless a MUST_FIX check explicitly requires a new plot."
                     )
+
+            # Findings count explosion warning
+            # A large increase in findings is a signal of overcorrection: the agent
+            # is expanding output breadth rather than fixing specific quality issues.
+            if len(_quality_trajectory) >= 2 and stage_name == "analysis":
+                _prev_findings = _quality_trajectory[-2].get("findings_count", 0)
+                _curr_findings = _quality_trajectory[-1].get("findings_count", 0)
+                if _prev_findings > 0 and _curr_findings > _prev_findings * 1.5:
+                    _retry_text += (
+                        f"\n\nFINDINGS COUNT WARNING: You produced {_curr_findings} findings "
+                        f"in the last iteration vs {_prev_findings} in the previous "
+                        f"(+{int((_curr_findings / _prev_findings - 1) * 100)}%). "
+                        "Do NOT add new findings indiscriminately. Focus on IMPROVING "
+                        "existing findings to address the flagged issues. Adding more "
+                        "findings does not resolve quality failures — it often introduces "
+                        "new ones. Improve depth and precision, not volume."
+                    )
+
+            # Scoped retry: when many MUST_FIX issues are present, instruct the agent
+            # to address the top issues only so it does not over-correct by rewriting
+            # everything and introducing new failures.
+            _must_fix_list = verdict.must_fix_failures()
+            if len(_must_fix_list) >= 5:
+                _top_issues = [c.name for c in _must_fix_list[:3]]
+                _retry_text += (
+                    f"\n\nSCOPED RETRY — {len(_must_fix_list)} MUST_FIX issues detected: "
+                    "address the TOP 3 only in this retry to avoid overcorrection.\n"
+                    f"Priority issues: {', '.join(_top_issues)}.\n"
+                    "Do NOT rewrite unrelated analysis. Do NOT add new plots or findings "
+                    "beyond what fixing these three specific issues requires. "
+                    "Targeted fixes prevent cascading new failures."
+                )
 
             base_payload["retry_instructions"] = _retry_text
 
@@ -4244,9 +4983,14 @@ class CaptainPipeline:
     # ──────────────────────────────────────────────────────────────────
 
     # ── Severity class mapping for scientific review mode (WP-3C) ──
+    # statistical_completeness: "poor" (completely absent) → MUST_FIX to force
+    # a plot-fix pass; "acceptable" (partial/incomplete) → SHOULD_FIX (advisory).
+    # The prompt defines "poor" as NO annotations at all and "acceptable" as
+    # present but incomplete, so this only triggers when annotations are fully absent.
     _SEVERITY_CLASS_MAP = {
         "scientific_validity": Severity.MUST_FIX,
-        "statistical_completeness": Severity.SHOULD_FIX,
+        "statistical_completeness": Severity.MUST_FIX,
+        "layout_quality": None,  # handled by dedicated elif below — specific fix instruction
         "cosmetic": None,  # informational — no retry
     }
 
@@ -4254,8 +4998,14 @@ class CaptainPipeline:
         self,
         listing: List[Dict[str, Any]],
         label: str,
+        skip_plots: Optional[Set[str]] = None,
     ) -> List[CheckResult]:
         """Per-plot VLM quality evaluation.  Returns CheckResult list.
+
+        skip_plots: plot filenames (basename only) to skip — used to suppress
+        re-evaluation of plots that exhausted their fix budget.  These plots
+        are still on disk for human inspection but should not re-trigger
+        VLM failures that the fix path has already acknowledged as unfixable.
 
         When visual_review_mode == "scientific" (WP-3C):
         - Uses SCIENTIFIC_VISUAL_REVIEW_PROMPT with per-criterion scoring
@@ -4300,6 +5050,32 @@ class CaptainPipeline:
             and item["path"].lower().endswith(".png")
         ]
 
+        def _call_vlm(messages: list) -> Any:
+            """Single VLM call; returns parsed JSON dict/list or None on failure."""
+            try:
+                if _use_openrouter_vlm:
+                    _resp = self._critic_client.chat.completions.create(
+                        model=self._critic_vision_model,
+                        messages=messages,
+                        max_tokens=1024 if scientific_mode else 800,
+                    )
+                    _reply = _resp.choices[0].message.content or ""
+                else:
+                    _r = _requests.post(
+                        f"{vlm_url}/chat/completions",
+                        json={
+                            "model": vlm_model,
+                            "messages": messages,
+                            "max_tokens": 800 if scientific_mode else 600,
+                        },
+                        timeout=600,
+                    )
+                    _reply = self._extract_vlm_reply(_r.json()["choices"][0]["message"])
+                return parse_json_tolerant(_reply)
+            except Exception as _exc:
+                logger.warning("VLM call failed: %s", _exc)
+                return None
+
         checks: List[CheckResult] = []
         for item in png_items:
             plot_path = Path(item["path"])
@@ -4307,6 +5083,14 @@ class CaptainPipeline:
 
             # Skip tiny/corrupt files — already caught by structural gate
             if not plot_path.exists() or plot_path.stat().st_size < 5000:
+                continue
+
+            # Skip plots that exhausted their fix budget — they stay on disk
+            # for human inspection but must not re-enter the VLM loop.
+            if skip_plots and fname in skip_plots:
+                logger.debug(
+                    "VLM evaluator: skipping exhausted plot %s", fname,
+                )
                 continue
 
             try:
@@ -4322,31 +5106,56 @@ class CaptainPipeline:
                          "text": f"Review this plot: {fname}"},
                     ]},
                 ]
-                if _use_openrouter_vlm:
-                    _vlm_resp = self._critic_client.chat.completions.create(
-                        model=self._critic_vision_model,
-                        messages=_vlm_messages,
-                        max_tokens=1024 if scientific_mode else 800,
-                    )
-                    reply = _vlm_resp.choices[0].message.content or ""
-                else:
-                    resp = _requests.post(
-                        f"{vlm_url}/chat/completions",
-                        json={
-                            "model": vlm_model,
-                            "messages": _vlm_messages,
-                            "max_tokens": 800 if scientific_mode else 600,
-                        },
-                        timeout=600,  # vLLM fallback: must wait out GroupChat queue
-                    )
-                    msg = resp.json()["choices"][0]["message"]
-                    reply = self._extract_vlm_reply(msg)
-                parsed = parse_json_tolerant(reply)
+
+                parsed = _call_vlm(_vlm_messages)
 
                 if scientific_mode and isinstance(parsed, dict):
-                    checks.extend(
-                        self._parse_scientific_review(parsed, fname)
-                    )
+                    # ── Double-evaluation: re-check any MUST_FIX failures ──
+                    # A single-pass VLM is too stochastic: genuine problems
+                    # (e.g. bar chart with no error bars) score "poor" only ~1/11
+                    # evaluations.  For any MUST_FIX criterion failure, run a
+                    # second independent evaluation.  Keep MUST_FIX only if both
+                    # passes agree; otherwise downgrade to SHOULD_FIX so the
+                    # issue is still flagged but does not hard-block the stage.
+                    first_checks = self._parse_scientific_review(parsed, fname)
+                    must_fix_failed = {
+                        c.name
+                        for c in first_checks
+                        if not c.passed and c.severity == Severity.MUST_FIX
+                    }
+                    if must_fix_failed:
+                        parsed2 = _call_vlm(_vlm_messages)
+                        if parsed2 is not None and isinstance(parsed2, dict):
+                            second_checks = self._parse_scientific_review(parsed2, fname)
+                            second_map = {c.name: c for c in second_checks}
+                            merged: List[CheckResult] = []
+                            for c in first_checks:
+                                if c.name in must_fix_failed:
+                                    second = second_map.get(c.name)
+                                    if second is not None and not second.passed and second.severity == Severity.MUST_FIX:
+                                        # Both passes agree → confirmed MUST_FIX
+                                        merged.append(c)
+                                    else:
+                                        # Passes disagree → downgrade to SHOULD_FIX
+                                        # (still flagged but not a hard block)
+                                        merged.append(CheckResult(
+                                            name=c.name,
+                                            passed=False,
+                                            severity=Severity.SHOULD_FIX,
+                                            category=c.category,
+                                            detail=c.detail + " [single-eval only — consider fixing]",
+                                            fix_instruction=c.fix_instruction,
+                                            ref=c.ref,
+                                        ))
+                                else:
+                                    merged.append(c)
+                            checks.extend(merged)
+                        else:
+                            # Second call failed — fall back to first result as-is
+                            checks.extend(first_checks)
+                    else:
+                        checks.extend(first_checks)
+
                 else:
                     # Baseline mode: overall score mapping
                     score = "good"
@@ -4487,8 +5296,24 @@ class CaptainPipeline:
                     ),
                     ref=fname,
                 ))
+            elif crit_score == "poor" and sev_class == "layout_quality":
+                # Overcrowding "poor" → SHOULD_FIX (not MUST_FIX; hard-block would be
+                # too aggressive given VLM variability on layout judgements)
+                checks.append(CheckResult(
+                    name=f"plot_sci__{fname}__{crit_name}",
+                    passed=False,
+                    severity=Severity.SHOULD_FIX,
+                    category=CheckCategory.PLOT_QUALITY,
+                    detail=f"[{sev_class}] {crit_name}: poor — {issue}",
+                    fix_instruction=suggestion or (
+                        f"Reduce the number of series or groups in '{fname}'. "
+                        "Split into multiple subplots if >10 groups, or aggregate. "
+                        "Target aspect ratio between 1:1 and 2:1 (width:height)."
+                    ),
+                    ref=fname,
+                ))
             else:
-                # good score, or acceptable in scientific_validity (not a failure)
+                # good score, or acceptable in scientific_validity/layout_quality (not a failure)
                 checks.append(CheckResult(
                     name=f"plot_sci__{fname}__{crit_name}",
                     passed=True,
@@ -4517,7 +5342,7 @@ class CaptainPipeline:
         failing_checks: List[CheckResult],
         payload: Dict[str, Any],
         label: str,
-    ) -> bool:
+    ) -> "Tuple[bool, Set[str]]":
         """Attempt lightweight plot fixes for VLM-flagged plots.
 
         For each failing plot (capped at 5):
@@ -4527,15 +5352,23 @@ class CaptainPipeline:
         4. Execute via subprocess.run() in exec_workdir
         5. Verify success via file size check
         6. Re-evaluate the fixed plot with VLM (post-fix verification)
-        7. If still failing: revert to original; if MUST_FIX → delete plot
-        8. Return True if any plot was fixed or deleted
+        7. If still failing after all attempts: leave on disk but add to
+           exhausted_plots so subsequent VLM passes skip it.
+        8. Return (any_fixed, exhausted_plots) where exhausted_plots is the
+           set of plot filenames that consumed their full fix budget.
 
-        Max 1 fix attempt per plot. Does not touch passing plots.
+        Max 2 fix attempts per plot. Does not touch passing plots.
         """
         import subprocess
 
+        # Clear the abort flag so that OpenAIWrapper calls made here are not
+        # poisoned by a timeout/circuit-breaker that fired during the preceding
+        # CaptainAgent chat.  Plot fix and gap fill are independent recovery
+        # paths that deserve fresh LLM calls.
+        _abort_chat.clear()
+
         if not failing_checks:
-            return False
+            return False, set()
 
         output_dir = payload.get("output_dir", "")
         cleaned_path = payload.get("cleaned_path", "") or payload.get("input_paths", {}).get("cleaned", "")
@@ -4560,6 +5393,12 @@ class CaptainPipeline:
             "The script must be complete — include ALL imports. "
             "Use plt.savefig() with dpi=300, bbox_inches='tight'. "
             "Do NOT use plt.show().\n\n"
+            "PERFORMANCE: If the parquet has more than 100,000 rows, SAMPLE or "
+            "AGGREGATE before plotting.  For scatter: df.sample(n=50000, random_state=42). "
+            "For violin/box: aggregate to group-level first.  Plotting millions of "
+            "raw points will timeout.\n\n"
+            "PANDAS 4: Use df.select_dtypes(include=['object', 'string']) for text "
+            "columns, not just include=['object'].\n\n"
             "Output ONLY a ```python ... ``` code block. No explanation."
         )
 
@@ -4572,6 +5411,7 @@ class CaptainPipeline:
 
         any_fixed = False
         deleted_plots: List[str] = []
+        exhausted_plots: Set[str] = set()
         exec_dir = Path(output_dir) if output_dir else self.outputs_root / "exec_workdir"
         exec_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4626,6 +5466,7 @@ class CaptainPipeline:
 
             fix_succeeded = False
             _rejection_detail = ""
+            script_path = None
 
             for _fix_attempt in range(2):
                 _attempt_msg = user_msg
@@ -4659,18 +5500,28 @@ class CaptainPipeline:
                     # or '...' for these variables — this replacement ensures
                     # the script always runs with the real paths.
                     import re as _re
+                    _prepend_vars = []
                     for _var, _val in (
                         ("CLEANED_PATH", _abs_cleaned),
                         ("ANALYSIS_SUMMARY_PATH", _abs_summary),
                         ("PLOT_OUTPUT_PATH", _abs_plot),
                     ):
                         if _val:
-                            code = _re.sub(
+                            _new_code = _re.sub(
                                 rf"^{_var}\s*=\s*['\"].*?['\"]",
                                 f"{_var} = '{_val}'",
                                 code,
                                 flags=_re.MULTILINE,
                             )
+                            if _new_code == code:
+                                # Regex didn't match — the LLM didn't write
+                                # a quoted assignment.  Prepend the variable
+                                # so the script doesn't hit NameError.
+                                _prepend_vars.append(f"{_var} = '{_val}'")
+                            else:
+                                code = _new_code
+                    if _prepend_vars:
+                        code = "\n".join(_prepend_vars) + "\n" + code
                     # Write script to temp file and execute
                     script_path = exec_dir / f"_plot_fix_{plot_ref.replace('.png', '')}.py"
                     script_path.write_text(code, encoding="utf-8")
@@ -4678,7 +5529,7 @@ class CaptainPipeline:
                     result = subprocess.run(
                         [sys.executable, str(script_path)],
                         capture_output=True, text=True,
-                        timeout=120, cwd=str(exec_dir),
+                        timeout=300, cwd=str(exec_dir),
                     )
 
                     if result.returncode != 0:
@@ -4735,20 +5586,30 @@ class CaptainPipeline:
                         _fix_attempt + 1, plot_ref, exc,
                     )
 
-            # ── Deletion pathway: only after all retry attempts exhausted ──
+            # ── Unfixable plot: retire (rename + remove from summary) ──
+            # The plot is renamed to .png.unfixable so it remains on disk for
+            # human inspection but is invisible to rglob("*.png") and excluded
+            # from analysis_summary.json artifacts, covering all three report-
+            # selection paths.  It is also added to exhausted_plots so the VLM
+            # evaluator does not attempt to re-score it on subsequent passes.
             if not fix_succeeded and check.severity == Severity.MUST_FIX:
                 logger.warning(
-                    "Plot fix: deleting unfixable MUST_FIX plot %s after 2 attempt(s)",
+                    "Plot fix: could not fix MUST_FIX plot %s after 2 attempt(s) — "
+                    "retiring (renaming to .unfixable, removing from artifacts)",
                     plot_ref,
                 )
-                self._delete_plot(plot_path, analysis_summary_path, plot_ref)
-                deleted_plots.append(plot_ref)
-                any_fixed = True  # deletion counts as remediation
+                self._retire_plot(plot_path, analysis_summary_path, plot_ref)
+                exhausted_plots.add(plot_ref)
 
-            # Clean up backup
+            # Clean up backup and generated fix scripts
             if backup_path.exists():
                 try:
                     backup_path.unlink()
+                except OSError:
+                    pass
+            if script_path and script_path.exists():
+                try:
+                    script_path.unlink()
                 except OSError:
                     pass
 
@@ -4759,11 +5620,12 @@ class CaptainPipeline:
                     "attempted": len(failing_checks[:5]),
                     "any_fixed": any_fixed,
                     "deleted": deleted_plots,
+                    "exhausted": sorted(exhausted_plots),
                     "max_attempts_per_plot": 2,
                 },
             )
 
-        return any_fixed
+        return any_fixed, exhausted_plots
 
     def _verify_fixed_plot(
         self,
@@ -4817,34 +5679,45 @@ class CaptainPipeline:
                 return not resolved  # True = still failing
         except Exception as exc:
             logger.warning(
-                "Post-fix VLM verification failed for %s: %s — assuming fixed",
+                "Post-fix VLM verification failed for %s: %s — assuming NOT fixed",
                 plot_path.name, exc,
             )
-        return False  # assume fixed on error (don't punish)
+        return True  # assume NOT fixed on VLM error — keep retrying
 
     @staticmethod
-    def _delete_plot(
+    def _retire_plot(
         plot_path: Path,
         analysis_summary_path: str,
         plot_ref: str,
     ) -> None:
-        """Remove a plot from disk and from analysis_summary.json artifacts."""
-        # Delete from disk
+        """Retire an unfixable plot: rename it so it is invisible to rglob and
+        report selection, and remove its references from analysis_summary.json.
+
+        The file is NOT deleted — it remains on disk as ``<name>.png.unfixable``
+        for human inspection.  All three report-selection paths are covered:
+          1. analysis_summary.json artifacts list (report prompt)
+          2. rglob("*.png") in report context sections
+          3. rglob("*.png") in cross-validation figure matching
+        """
+        # Rename to .png.unfixable so rglob("*.png") never finds it
+        unfixable_path = plot_path.with_suffix(".png.unfixable")
         try:
             if plot_path.exists():
-                plot_path.unlink()
-                logger.info("Deleted unfixable plot: %s", plot_ref)
+                plot_path.rename(unfixable_path)
+                logger.info(
+                    "Retired unfixable plot %s → %s",
+                    plot_ref, unfixable_path.name,
+                )
         except OSError as exc:
-            logger.warning("Failed to delete plot %s: %s", plot_ref, exc)
+            logger.warning("Failed to rename plot %s: %s", plot_ref, exc)
 
-        # Remove from analysis_summary.json artifacts list
+        # Remove from analysis_summary.json artifacts list and figure_ref fields
         if analysis_summary_path and Path(analysis_summary_path).exists():
             try:
                 asp = Path(analysis_summary_path)
                 summary = json.loads(asp.read_text("utf-8"))
                 artifacts = summary.get("artifacts", [])
                 original_count = len(artifacts)
-                # Filter out references to the deleted plot
                 plot_stem = Path(plot_ref).stem.lower()
                 summary["artifacts"] = [
                     a for a in artifacts
@@ -4855,7 +5728,7 @@ class CaptainPipeline:
                         and Path(str(a.get("path", a.get("file", "")))).stem.lower() == plot_stem
                     )
                 ]
-                # Also remove from findings that reference this plot
+                # Nullify figure_ref in any finding that referenced this plot
                 findings = summary.get("findings", [])
                 for f in findings:
                     if isinstance(f, dict) and f.get("figure_ref"):
@@ -4873,9 +5746,174 @@ class CaptainPipeline:
                 )
             except Exception as exc:
                 logger.warning(
-                    "Failed to update analysis_summary.json after plot deletion: %s",
+                    "Failed to update analysis_summary.json after retiring plot: %s",
                     exc,
                 )
+
+    @staticmethod
+    def _delete_plot(
+        plot_path: Path,
+        analysis_summary_path: str,
+        plot_ref: str,
+    ) -> None:
+        """Remove a plot from disk and from analysis_summary.json artifacts.
+
+        Prefer ``_retire_plot`` for unfixable plots — it keeps the file for
+        human inspection while still excluding it from report selection.
+        """
+        try:
+            if plot_path.exists():
+                plot_path.unlink()
+                logger.info("Deleted plot: %s", plot_ref)
+        except OSError as exc:
+            logger.warning("Failed to delete plot %s: %s", plot_ref, exc)
+
+        # Remove from analysis_summary.json (same logic as _retire_plot)
+        if analysis_summary_path and Path(analysis_summary_path).exists():
+            try:
+                asp = Path(analysis_summary_path)
+                summary = json.loads(asp.read_text("utf-8"))
+                artifacts = summary.get("artifacts", [])
+                plot_stem = Path(plot_ref).stem.lower()
+                summary["artifacts"] = [
+                    a for a in artifacts
+                    if not (
+                        isinstance(a, str) and Path(a).stem.lower() == plot_stem
+                    ) and not (
+                        isinstance(a, dict)
+                        and Path(str(a.get("path", a.get("file", "")))).stem.lower() == plot_stem
+                    )
+                ]
+                for f in summary.get("findings", []):
+                    if isinstance(f, dict) and f.get("figure_ref"):
+                        if Path(str(f["figure_ref"])).stem.lower() == plot_stem:
+                            f["figure_ref"] = None
+                asp.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+            except Exception as exc:
+                logger.warning("Failed to update analysis_summary.json after deletion: %s", exc)
+
+    # ──────────────────────────────────────────────────────────────────
+    # WP-C2: Deterministic plot-finding alignment fix
+    # ──────────────────────────────────────────────────────────────────
+
+    def _fix_plot_finding_alignment(
+        self,
+        failing_checks: List["CheckResult"],
+        payload: Dict[str, Any],
+        listing: List[Dict[str, Any]],
+        label: str,
+    ) -> bool:
+        """Deterministic fix: assign unreferenced PNGs to findings via figure_ref.
+
+        Extends the pre-critic _inject_figure_refs pass with two improvements:
+        1. Converts string findings to dicts so figure_ref can be added.
+        2. Falls back to the longest unreferenced finding when no token overlap
+           exists (the pre-pass requires best_score >= 1).
+        """
+        asp = payload.get("analysis_summary_path", "")
+        if not asp or not Path(asp).exists():
+            return False
+
+        try:
+            summary = json.loads(Path(asp).read_text("utf-8"))
+        except Exception:
+            return False
+
+        findings = summary.get("findings", [])
+        if not findings:
+            return False
+
+        # Collect PNGs from listing (same pattern as _inject_figure_refs)
+        pngs = [
+            Path(f["path"]).name
+            for f in listing
+            if isinstance(f, dict)
+            and isinstance(f.get("path"), str)
+            and f["path"].lower().endswith(".png")
+            and Path(f["path"]).exists()
+        ]
+        if not pngs:
+            return False
+
+        # Build set of already-referenced PNGs
+        referenced: Set[str] = set()
+        for f in findings:
+            text = _finding_text(f).lower()
+            if isinstance(f, dict):
+                text += " " + str(f.get("figure_ref") or "")
+                text += " " + str(f.get("figure") or "")
+            for png in pngs:
+                stem = Path(png).stem.lower()
+                if stem in text or png.lower() in text:
+                    referenced.add(png)
+        unreferenced = [p for p in pngs if p not in referenced]
+        if not unreferenced:
+            return False
+
+        # Convert any string findings to dicts so we can set figure_ref
+        for i, f in enumerate(findings):
+            if isinstance(f, str):
+                findings[i] = {"text": f}
+
+        assigned = 0
+        assignments: Dict[str, str] = {}
+        for png in unreferenced:
+            stem_tokens = set(
+                Path(png).stem.lower().replace("-", "_").split("_")
+            )
+            meaningful = {t for t in stem_tokens if len(t) > 2 and not t.isdigit()}
+
+            best_idx = -1
+            best_score = 0
+            for idx, f in enumerate(findings):
+                if not isinstance(f, dict):
+                    continue
+                f_text = f.get("text", "").lower()
+                score = sum(1 for t in meaningful if t in f_text)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+            # Fallback: assign to the longest finding without a figure_ref
+            if best_idx < 0:
+                best_len = 0
+                for idx, f in enumerate(findings):
+                    if not isinstance(f, dict):
+                        continue
+                    if f.get("figure_ref") or f.get("figure"):
+                        continue
+                    f_len = len(f.get("text", ""))
+                    if f_len > best_len:
+                        best_len = f_len
+                        best_idx = idx
+
+            if best_idx >= 0:
+                findings[best_idx]["figure_ref"] = png
+                assigned += 1
+                assignments[png] = findings[best_idx].get("text", "")[:60]
+
+        if assigned == 0:
+            return False
+
+        summary["findings"] = findings
+        try:
+            Path(asp).write_text(
+                json.dumps(summary, indent=2, default=str), "utf-8"
+            )
+        except Exception as exc:
+            logger.warning("Alignment fix write failed for %s: %s", label, exc)
+            return False
+
+        logger.info(
+            "Alignment fix for %s: assigned %d/%d unreferenced PNGs to findings",
+            label, assigned, len(unreferenced),
+        )
+        if self.debug_root:
+            safe_write_json(
+                self.debug_root / f"{label}__alignment_fix.json",
+                {"assignments": assignments, "total_unreferenced": len(unreferenced)},
+            )
+        return True
 
     # ──────────────────────────────────────────────────────────────────
     # WP-C2: Targeted finding fix
@@ -4887,11 +5925,13 @@ class CaptainPipeline:
         payload: Dict[str, Any],
         label: str,
     ) -> bool:
-        """Targeted regeneration of specific findings in analysis_summary.json.
+        """Surgical fix of specific findings in analysis_summary.json.
 
-        Uses a direct LLM call (not CaptainAgent) to rewrite failing findings
-        with improved interpretation depth, statistical rigor, or domain context.
-        Patches analysis_summary.json in-place and returns True if successful.
+        Pass C: Instead of replacing the entire findings array, this now
+        identifies which findings are implicated by the failing checks
+        and only rewrites those.  Untouched findings are preserved exactly
+        as-is to prevent regression.  Falls back to full rewrite only when
+        the failing checks don't reference specific findings.
         """
         from tools import RefinementDirective  # noqa: F811
 
@@ -4910,28 +5950,87 @@ class CaptainPipeline:
         if not findings:
             return False
 
+        # ── Identify which findings need rewriting ──
+        # Check results may reference specific findings via .ref (e.g.
+        # "finding_3") or mention finding text.  Collect indices.
+        _target_indices: set = set()
+        for c in directive.check_results:
+            # Check .ref for finding index references
+            if c.ref:
+                for _part in str(c.ref).replace(",", " ").split():
+                    _part = _part.strip().lower()
+                    if _part.startswith("finding_"):
+                        try:
+                            _idx = int(_part.split("_", 1)[1])
+                            if 0 <= _idx < len(findings):
+                                _target_indices.add(_idx)
+                        except (ValueError, IndexError):
+                            pass
+            # Check fix_instruction for quoted finding text snippets
+            if c.fix_instruction:
+                _fi_lower = c.fix_instruction.lower()
+                for i, f in enumerate(findings):
+                    _ft = _finding_text(f).strip()[:80].lower()
+                    if _ft and len(_ft) > 20 and _ft in _fi_lower:
+                        _target_indices.add(i)
+
+        # If no specific findings identified, target all findings
+        # that lack domain interpretation (the most common issue)
+        _surgical = bool(_target_indices)
+        if not _target_indices:
+            _target_indices = set(range(min(len(findings), 10)))
+
+        _target_list = sorted(_target_indices)
+        _targeted_findings = [
+            (i, findings[i]) for i in _target_list
+        ]
+
         # Build a focused prompt with the specific issues
         issues_text = "\n".join(
             f"- [{c.name}] {c.fix_instruction}" for c in directive.check_results
         )
-        finding_fix_prompt = (
-            "You are a scientific analysis editor. You are given an analysis_summary.json "
-            "and specific quality issues with its findings. Your task is to REWRITE the "
-            "findings to fix the identified issues.\n\n"
-            "RULES:\n"
-            "- Preserve all numeric values and data references\n"
-            "- Add biological/process significance to bare deviations\n"
-            "- Add root cause hypotheses where missing\n"
-            "- Do NOT invent data — only interpret existing values\n"
-            "- Return the COMPLETE updated findings array as a JSON array\n\n"
-            "OUTPUT: A JSON array of strings (the updated findings). No explanation."
-        )
 
-        user_msg = (
-            f"CURRENT FINDINGS ({len(findings)} total):\n"
-            + "\n".join(f"  {i+1}. {_finding_text(f)}" for i, f in enumerate(findings[:10]))
-            + f"\n\nISSUES TO FIX:\n{issues_text}"
-        )
+        if _surgical:
+            finding_fix_prompt = (
+                "You are a scientific analysis editor. You are given SPECIFIC findings "
+                "from an analysis_summary.json that have quality issues. Your task is to "
+                "REWRITE ONLY these findings to fix the identified issues.\n\n"
+                "RULES:\n"
+                "- Preserve all numeric values and data references\n"
+                "- Add biological/process significance to bare deviations\n"
+                "- Add root cause hypotheses where missing\n"
+                "- Do NOT invent data — only interpret existing values\n"
+                "- Return EXACTLY the same number of findings as provided\n"
+                "- Maintain the same order\n"
+                "- Each finding should be returned as a JSON object with a 'text' field\n\n"
+                f"OUTPUT: A JSON array of {len(_targeted_findings)} finding objects. No explanation."
+            )
+            user_msg = (
+                f"FINDINGS TO REWRITE ({len(_targeted_findings)} of {len(findings)} total):\n"
+                + "\n".join(
+                    f"  {i+1}. [index {idx}] {_finding_text(f)}"
+                    for i, (idx, f) in enumerate(_targeted_findings)
+                )
+                + f"\n\nISSUES TO FIX:\n{issues_text}"
+            )
+        else:
+            finding_fix_prompt = (
+                "You are a scientific analysis editor. You are given an analysis_summary.json "
+                "and specific quality issues with its findings. Your task is to REWRITE the "
+                "findings to fix the identified issues.\n\n"
+                "RULES:\n"
+                "- Preserve all numeric values and data references\n"
+                "- Add biological/process significance to bare deviations\n"
+                "- Add root cause hypotheses where missing\n"
+                "- Do NOT invent data — only interpret existing values\n"
+                "- Return the COMPLETE updated findings array as a JSON array\n\n"
+                "OUTPUT: A JSON array of finding objects (the updated findings). No explanation."
+            )
+            user_msg = (
+                f"CURRENT FINDINGS ({len(findings)} total):\n"
+                + "\n".join(f"  {i+1}. {_finding_text(f)}" for i, f in enumerate(findings[:10]))
+                + f"\n\nISSUES TO FIX:\n{issues_text}"
+            )
 
         try:
             from autogen.oai import OpenAIWrapper
@@ -4949,21 +6048,59 @@ class CaptainPipeline:
                 response.choices[0].message.content or ""
             )
             new_findings = parse_json_tolerant(reply)
-            if not isinstance(new_findings, list) or len(new_findings) < len(findings):
+            if not isinstance(new_findings, list):
                 logger.warning(
-                    "Finding fix: LLM returned invalid findings (got %s, expected list of %d)",
-                    type(new_findings).__name__, len(findings),
+                    "Finding fix: LLM returned %s, expected list",
+                    type(new_findings).__name__,
                 )
                 return False
 
-            # Patch in-place
-            summary["findings"] = new_findings
+            # ── Merge strategy ──
+            if _surgical and len(new_findings) == len(_targeted_findings):
+                # Surgical merge: replace only the targeted findings by index
+                merged = list(findings)  # shallow copy
+                for (orig_idx, _), new_f in zip(_targeted_findings, new_findings):
+                    # Preserve figure_ref and other metadata from the original
+                    if isinstance(findings[orig_idx], dict) and isinstance(new_f, dict):
+                        _merged_finding = dict(findings[orig_idx])
+                        _merged_finding["text"] = new_f.get("text", _finding_text(new_f))
+                        # Preserve figure_ref unless the new finding explicitly sets one
+                        if "figure_ref" not in new_f and "figure_ref" in _merged_finding:
+                            pass  # keep original
+                        elif "figure_ref" in new_f:
+                            _merged_finding["figure_ref"] = new_f["figure_ref"]
+                        merged[orig_idx] = _merged_finding
+                    elif isinstance(new_f, str):
+                        # LLM returned a string; wrap it preserving original metadata
+                        if isinstance(findings[orig_idx], dict):
+                            _merged_finding = dict(findings[orig_idx])
+                            _merged_finding["text"] = new_f
+                            merged[orig_idx] = _merged_finding
+                        else:
+                            merged[orig_idx] = new_f
+                    else:
+                        merged[orig_idx] = new_f
+                summary["findings"] = merged
+                logger.info(
+                    "Finding fix (surgical): merged %d/%d findings for %s",
+                    len(_targeted_findings), len(findings), label,
+                )
+            else:
+                # Fallback: full replacement (original behaviour)
+                if len(new_findings) < len(findings):
+                    logger.warning(
+                        "Finding fix: LLM returned %d findings, expected >= %d",
+                        len(new_findings), len(findings),
+                    )
+                    return False
+                summary["findings"] = new_findings
+                logger.info(
+                    "Finding fix (full): %d findings rewritten for %s",
+                    len(new_findings), label,
+                )
+
             Path(asp).write_text(
                 json.dumps(summary, indent=2, default=str), encoding="utf-8"
-            )
-            logger.info(
-                "Finding fix succeeded: %d findings rewritten for %s",
-                len(new_findings), label,
             )
 
             if self.debug_root:
@@ -4971,7 +6108,9 @@ class CaptainPipeline:
                     self.debug_root / f"{label}__finding_fix.json",
                     {
                         "original_count": len(findings),
-                        "new_count": len(new_findings),
+                        "new_count": len(summary["findings"]),
+                        "surgical": _surgical,
+                        "targeted_indices": _target_list,
                         "issues_addressed": [c.name for c in directive.check_results],
                     },
                 )
@@ -5025,6 +6164,8 @@ class CaptainPipeline:
             _meaningful = {"process_phase", "experimental_condition", "experimental_unit"}
             _used_cols = set(self.grouping_columns or [])
             _missing = []
+            _patch_dim_names: List[str] = []
+            _patch_dim_cols: List[str] = []
             for dim in _dims:
                 _purpose = dim.get("semantic_purpose", dim.get("purpose", ""))
                 _dim_cols = set(dim.get("columns", []))
@@ -5037,8 +6178,39 @@ class CaptainPipeline:
                         f"  - {_name}: column(s)={_cols}, cardinality={_card}, "
                         f"example values=[{_vals}]"
                     )
+                    _patch_dim_names.append(_name)
+                    _patch_dim_cols.append(_cols[0] if _cols else _name)
             if _missing:
                 _missing_dims_text = "Missing dimensions:\n" + "\n".join(_missing)
+
+        # Build a concrete schema example with the actual dimension names so the
+        # LLM knows exactly which key names to use in secondary_analysis.
+        if _patch_dim_names:
+            _schema_entries = "".join(
+                f'     "{dname}": {{\n'
+                f'       "grouping_by": "{dcol}",\n'
+                f'       "summary": "one-sentence summary of {dname} analysis",\n'
+                f'       "key_findings": ["<finding 1 for {dname}>", "<finding 2>"]\n'
+                f'     }},\n'
+                for dname, dcol in zip(_patch_dim_names[:3], _patch_dim_cols[:3])
+            )
+            _schema_example = "   {\n" + _schema_entries + "   }"
+            _key_names_note = (
+                f"IMPORTANT: The top-level keys inside 'secondary_analysis' MUST be named "
+                f"exactly: {', '.join(repr(n) for n in _patch_dim_names[:3])}. "
+                "Do NOT use generic names like 'additional' or 'other'.\n"
+            )
+        else:
+            _schema_example = (
+                "   {\n"
+                "     \"<dimension_name>\": {\n"
+                "       \"grouping_by\": \"<column_name>\",\n"
+                "       \"summary\": \"one-sentence summary\",\n"
+                "       \"key_findings\": [\"finding 1\", \"finding 2\"]\n"
+                "     }\n"
+                "   }"
+            )
+            _key_names_note = ""
 
         prompt = (
             "You are a data analysis specialist. Write a STANDALONE Python script that "
@@ -5060,14 +6232,9 @@ class CaptainPipeline:
             "2. Load the existing analysis_summary.json (as shown above).\n"
             "3. For each missing dimension listed below, compute group-level descriptive "
             "statistics (mean, std, n per group) and write a one-sentence finding.\n"
-            "4. Set _summary['secondary_analysis'] with schema:\n"
-            "   {\n"
-            "     \"<dimension_name>\": {\n"
-            "       \"grouping_by\": \"<column_name>\",\n"
-            "       \"summary\": \"one-sentence summary\",\n"
-            "       \"key_findings\": [\"finding 1\", \"finding 2\"]\n"
-            "     }\n"
-            "   }\n"
+            f"4. Set _summary['secondary_analysis'] with this EXACT schema:\n"
+            f"{_schema_example}\n"
+            f"{_key_names_note}"
             "5. Write the full updated _summary back (as shown above).\n"
             "6. Do NOT modify any other keys in the file.\n"
             "7. Do NOT generate or delete any plots.\n\n"
@@ -5086,6 +6253,7 @@ class CaptainPipeline:
             f"Fix instruction: {_fix_instruction}"
         )
 
+        script_path = None
         try:
             from autogen.oai import OpenAIWrapper
 
@@ -5128,7 +6296,7 @@ class CaptainPipeline:
             result = _subprocess.run(
                 [sys.executable, str(script_path)],
                 capture_output=True, text=True,
-                timeout=120, cwd=str(exec_dir),
+                timeout=300, cwd=str(exec_dir),
             )
 
             if result.returncode != 0:
@@ -5171,6 +6339,12 @@ class CaptainPipeline:
         except Exception as exc:
             logger.warning("Secondary analysis patch failed for %s: %s", label, exc)
             return False
+        finally:
+            if script_path and script_path.exists():
+                try:
+                    script_path.unlink()
+                except OSError:
+                    pass
 
     # ──────────────────────────────────────────────────────────────────
 
@@ -5187,6 +6361,11 @@ class CaptainPipeline:
         Never overwrites existing artifacts.
         """
         import subprocess as _subprocess
+
+        # Clear the abort flag so that OpenAIWrapper calls made here are not
+        # poisoned by a timeout/circuit-breaker that fired during the preceding
+        # CaptainAgent chat (same rationale as in _fix_plots).
+        _abort_chat.clear()
 
         asp = payload.get("analysis_summary_path", "")
         # cleaned_path may be nested under input_paths (analysis stage payload
@@ -5217,18 +6396,25 @@ class CaptainPipeline:
             "    _summary = json.load(_f)\n"
             "# ... compute new findings, per_group entries ...\n"
             "_summary.setdefault('findings', []).extend([NEW_FINDINGS])\n"
+            "# per_group is ALWAYS a dict mapping group_name -> {metric: value}.\n"
+            "# Use .update() to merge new groups — NEVER use .append() or .extend().\n"
             "_summary.setdefault('per_group', {}).update({NEW_PER_GROUP})\n"
             "with open(ANALYSIS_SUMMARY_PATH, 'w') as _f:\n"
             "    json.dump(_summary, _f, indent=2, default=str)\n"
             "```\n"
             "NEVER create a fresh dict and write it — ALWAYS load the existing file "
             "first and extend/update only the relevant keys.\n\n"
+            "TYPE RULES FOR per_group:\n"
+            "- per_group is a DICT (not a list). Keys are group names, values are "
+            "dicts of metrics.  Example: {\"Run_1\": {\"mean_uv\": 0.45, \"cv\": 0.12}}\n"
+            "- To add new groups: _summary.setdefault('per_group', {}).update(new_dict)\n"
+            "- NEVER call .append() or .extend() on per_group — it is NOT a list.\n\n"
             "RULES:\n"
             "1. Reads the cleaned data from the parquet file.\n"
             "2. Load the existing analysis_summary.json (as shown above).\n"
             "3. Performs ONLY the missing analyses described below.\n"
-            "4. APPENDS new findings to the existing findings array.\n"
-            "5. APPENDS new per_group/per_run_per_stage entries (do NOT overwrite).\n"
+            "4. APPENDS new findings to the existing findings list via .extend().\n"
+            "5. MERGES new per_group entries via .update() (do NOT overwrite existing keys).\n"
             "6. Saves any new plots to the output directory.\n"
             "7. Writes the full updated summary back (as shown above).\n\n"
             "CRITICAL: Do NOT delete or overwrite existing findings, plots, or data.\n"
@@ -5243,6 +6429,7 @@ class CaptainPipeline:
             f"MISSING ANALYSES TO ADD:\n{gaps_text}"
         )
 
+        script_path = None
         try:
             from autogen.oai import OpenAIWrapper
 
@@ -5271,18 +6458,63 @@ class CaptainPipeline:
             import re as _re
             _abs_cleaned = str(Path(cleaned_path).resolve()) if cleaned_path else ""
             _abs_summary = str(Path(asp).resolve()) if asp else ""
+            _prepend_vars = []
             for _var, _val in (
                 ("CLEANED_PATH", _abs_cleaned),
                 ("ANALYSIS_SUMMARY_PATH", _abs_summary),
                 ("OUTPUT_DIR", str(Path(output_dir).resolve())),
             ):
                 if _val:
-                    code = _re.sub(
+                    _new_code = _re.sub(
                         rf"^{_var}\s*=\s*['\"].*?['\"]",
                         f"{_var} = '{_val}'",
                         code,
                         flags=_re.MULTILINE,
                     )
+                    if _new_code == code:
+                        # Regex didn't match — prepend the variable so the
+                        # script doesn't hit NameError.
+                        _prepend_vars.append(f"{_var} = '{_val}'")
+                    else:
+                        code = _new_code
+            if _prepend_vars:
+                code = "\n".join(_prepend_vars) + "\n" + code
+
+            # ── Runtime normalisation guard ──
+            # Even with clear prompt instructions, the LLM sometimes calls
+            # .append()/.extend() on per_group (which is a dict).  Inject a
+            # monkey-patch at the top of the script that normalises per_group
+            # to a dict immediately after the summary is loaded, so list
+            # operations become impossible.
+            _normalise_snippet = (
+                "\n# -- injected by gap-fill harness: normalise per_group --\n"
+                "import json as _json_norm\n"
+                "def _normalise_per_group(_path):\n"
+                "    with open(_path) as _f:\n"
+                "        _d = _json_norm.load(_f)\n"
+                "    _pg = _d.get('per_group')\n"
+                "    if isinstance(_pg, list):\n"
+                "        _new = {}\n"
+                "        for _item in _pg:\n"
+                "            if isinstance(_item, dict) and 'group' in _item:\n"
+                "                _gk = _item.pop('group')\n"
+                "                _new[_gk] = _item\n"
+                "            elif isinstance(_item, dict):\n"
+                "                _new.update(_item)\n"
+                "        _d['per_group'] = _new\n"
+                "        with open(_path, 'w') as _f:\n"
+                "            _json_norm.dump(_d, _f, indent=2, default=str)\n"
+                "# -------------------------------------------------------\n"
+            )
+            code = _normalise_snippet + code
+            # Inject the normalisation call right after any json.load of the
+            # summary file, but the simplest reliable approach is to call it
+            # once at the top of main() execution — prepend a call after the
+            # snippet definition using the resolved summary path.
+            code = code + (
+                "\n# -- injected: ensure per_group is dict before exit --\n"
+                f"_normalise_per_group('{str(Path(asp).resolve())}')\n"
+            )
 
             exec_dir = Path(output_dir)
             exec_dir.mkdir(parents=True, exist_ok=True)
@@ -5327,6 +6559,12 @@ class CaptainPipeline:
         except Exception as exc:
             logger.warning("Gap fill failed for %s: %s", label, exc)
             return False
+        finally:
+            if script_path and script_path.exists():
+                try:
+                    script_path.unlink()
+                except OSError:
+                    pass
 
     # ──────────────────────────────────────────────────────────────────
     # Phase 6: Claim-evidence evaluation for reports
@@ -5956,9 +7194,12 @@ class CaptainPipeline:
             _execution_agents = [a for a in required_agents if a != "analysis_planner"]
             if not _execution_agents:
                 _execution_agents = required_agents  # safety fallback
+            # Split: domain/stat experts (no ML) vs ML-only for dedicated MODEL pass
+            _execution_agents_no_ml = [a for a in _execution_agents if a != "ml_modeler"]
+            _ml_agents = [a for a in _execution_agents if a == "ml_modeler"]
 
             _strategy_block = (
-                "THREE-PASS ANALYSIS STRATEGY — follow this sequence exactly:\n\n"
+                "FIVE-PASS ANALYSIS STRATEGY — follow this sequence exactly:\n\n"
                 "1. First seek_experts_help call — PLAN (group_name MUST contain 'plan'):\n"
                 "   group_name: '<dataset>_analysis_plan_team'\n"
                 "   building_task: 'An analysis_planner to recommend 5-8 diverse analytical\n"
@@ -5978,7 +7219,8 @@ class CaptainPipeline:
                 "   group_name: '<dataset>_analysis_review_team'\n"
                 "   building_task: 'Domain experts to review and improve the analysis plan\n"
                 "   using their specialist knowledge. No code execution needed.'\n"
-                f"   Include the domain expert(s): {_execution_agents}.\n"
+                f"   Include the domain expert(s): {_execution_agents_no_ml}.\n"
+                "   DO NOT include ml_modeler — it has a dedicated pass later.\n"
                 "   In your execution_task, include the planner's plan AND the full data profile.\n"
                 "   Frame the task as:\n"
                 "     'PLAN REVIEW — use your domain expertise to improve this plan.\n"
@@ -5992,29 +7234,59 @@ class CaptainPipeline:
                 "   IMPORTANT: This pass produces a reviewed plan, NOT code or plots.\n\n"
                 "3. Third seek_experts_help call — EXECUTE (group_name MUST NOT contain 'plan' or 'review'):\n"
                 "   group_name: '<dataset>_analysis_execution_team'\n"
-                f"   Include the domain expert(s): {_execution_agents}. You MUST include ALL of these.\n"
+                f"   Include the domain expert(s): {_execution_agents_no_ml}. You MUST include ALL of these.\n"
+                "   DO NOT include ml_modeler — it has a dedicated pass later.\n"
                 "   In your execution_task, include the expert-reviewed plan from Pass 2.\n"
                 "   Prefix with: 'ANALYSIS PLAN (expert-reviewed — execute this):'\n"
                 "   Add: 'This plan has been reviewed and improved by domain experts.\n"
                 "   Execute the kept and modified items. Include the expert_additions.\n"
                 "   Document reasoning in domain_reasoning field of analysis_summary.json.'\n"
                 "   The domain expert generates the actual plots and analysis_summary.json.\n\n"
-                "4. (OPTIONAL) Fourth seek_experts_help call — REFLECT (group_name MUST contain 'reflect'):\n"
+                "4. Fourth seek_experts_help call — MODEL (group_name MUST contain 'model'):\n"
+                "   group_name: '<dataset>_analysis_model_team'\n"
+                "   building_task: 'ML modeler to build supervised predictive models using\n"
+                "   the cleaned dataset and findings from the execution pass.'\n"
+                f"   Include ONLY: {_ml_agents}. Do NOT include other domain experts.\n"
+                "   In your execution_task:\n"
+                "   (a) Include the analysis_summary.json from Pass 3 so the modeler\n"
+                "       has context on what statistical patterns were already found.\n"
+                "   (b) Include the ml_tasks configuration from the payload (if present).\n"
+                "   (c) Include the cleaned data path and output directory.\n"
+                "   Frame the task as:\n"
+                "     'ML MODELLING PASS — you have a dedicated pass for predictive modelling.\n"
+                "     Read the analysis_summary.json from the execution pass for context.\n"
+                "     Attempt each ml_task in order (classification and regression targets).\n"
+                "     Aggregate data per aggregate_by before modelling.\n"
+                "     Report model metrics, feature importance, and per_group performance.\n"
+                "     APPEND new findings, plots, and artifacts to analysis_summary.json.\n"
+                "     Do NOT overwrite existing entries from the execution pass.'\n"
+                "   This pass focuses EXCLUSIVELY on supervised prediction and feature\n"
+                "   importance — do NOT duplicate statistical tests from Pass 3.\n\n"
+                "5. Fifth seek_experts_help call — REFLECT (group_name MUST contain 'reflect'):\n"
                 "   group_name: '<dataset>_analysis_reflect_team'\n"
-                f"   Include the domain expert(s): {_execution_agents}.\n"
-                "   building_task: 'Domain experts to review execution results, identify\n"
-                "   gaps or surprising patterns, and perform follow-up analyses.'\n"
-                "   execution_task: Read the analysis_summary.json produced by Pass 3.\n"
+                f"   Include the domain expert(s): {_execution_agents_no_ml}.\n"
+                "   DO NOT include ml_modeler — its work is complete.\n"
+                "   building_task: 'Domain experts to review execution and modelling results,\n"
+                "   identify gaps or surprising patterns, and perform follow-up analyses.'\n"
+                "   execution_task: Read the analysis_summary.json produced by Passes 3 and 4.\n"
                 "   Identify: (a) findings warranting deeper investigation,\n"
                 "   (b) grouping dimensions not yet explored (e.g. stage interactions),\n"
                 "   (c) unexpected patterns suggesting additional tests,\n"
-                "   (d) cross-dimensional analyses (e.g. does column effect vary by stage?).\n"
+                "   (d) cross-dimensional analyses (e.g. does column effect vary by stage?),\n"
+                "   (e) ML model outputs that warrant domain interpretation or follow-up.\n"
+                "   IMPORTANT: Try at least one analysis using a DIFFERENT grouping than\n"
+                "   Pass 3. Consult the ALTERNATIVE GROUPING CANDIDATES in the data profile\n"
+                "   and use a grouping not already explored. Focus on cross-dimensional\n"
+                "   interactions and multi-column breakdowns.\n"
                 "   APPEND new plots and findings — do NOT overwrite existing entries.\n"
-                "   SKIP this pass if budget is exhausted or Pass 3 already produced ≥8 findings.\n\n"
+                "   SKIP this pass ONLY if budget is exhausted.\n\n"
                 "NAMING CONVENTION — the group_name controls whether code execution is\n"
-                "available. Pass 1 (plan) and Pass 2 (review) MUST contain those keywords\n"
+                "available and which agents are used.\n"
+                "Pass 1 (plan) and Pass 2 (review) MUST contain those keywords\n"
                 "in group_name so the system disables code execution for those passes.\n"
-                "Pass 3 (execute) and Pass 4 (reflect) MUST NOT contain 'plan' or 'review'.\n\n"
+                "Pass 3 (execute), Pass 4 (model), and Pass 5 (reflect) MUST NOT contain\n"
+                "'plan' or 'review'. Pass 4 MUST contain 'model' so the system\n"
+                "selects only the ml_modeler agent for that call.\n\n"
             )
         else:
             _strategy_block = (
@@ -6168,6 +7440,33 @@ class CaptainPipeline:
         # Deterministic fallback: if findings[] is empty but per_run_per_stage exists,
         # auto-compute top-3 deviations and write them into the JSON now (no LLM needed).
         self._backfill_findings(analysis_summary_path)
+
+        # Deduplicate findings[] — Execute and Reflect passes both append, creating
+        # duplicates when both analyse the same pattern.  Normalise to text, dedup
+        # while preserving order, then write back.
+        if analysis_summary_path.exists():
+            try:
+                _data = json.loads(analysis_summary_path.read_text("utf-8"))
+                _findings = _data.get("findings", [])
+                if isinstance(_findings, list) and len(_findings) > 1:
+                    _seen: set = set()
+                    _unique: list = []
+                    for _f in _findings:
+                        _key = _finding_text(_f).strip().lower()[:200]
+                        if _key not in _seen:
+                            _seen.add(_key)
+                            _unique.append(_f)
+                    if len(_unique) < len(_findings):
+                        logger.info(
+                            "Deduped findings: %d → %d (%s)",
+                            len(_findings), len(_unique), analysis_summary_path.name,
+                        )
+                        _data["findings"] = _unique
+                        analysis_summary_path.write_text(
+                            json.dumps(_data, indent=2, default=str), encoding="utf-8"
+                        )
+            except Exception as _exc:
+                logger.warning("Finding deduplication failed: %s", _exc)
 
         # Disk-existence override
         ok = bool(result.get("ok", False))
@@ -6814,6 +8113,48 @@ class CaptainPipeline:
 
         return descriptions
 
+    @staticmethod
+    def _report_threshold_block(domain_hints: Dict[str, Any]) -> str:
+        """Return domain-conditional acceptance-criteria guidance for the report prompt.
+
+        WP-R2: Injects biologics/MS thresholds only when the domain matches.
+        Non-domain datasets receive a generic instruction instead.
+        """
+        is_chrom = bool(domain_hints.get("chromatography"))
+        is_ms = bool(domain_hints.get("mass_spectrometry"))
+        if not (is_chrom or is_ms):
+            return (
+                "Compare findings to domain-appropriate acceptance criteria if reference "
+                "ranges are known from the dataset context. State clearly when a value "
+                "passes or fails any applicable threshold."
+            )
+        lines = [
+            "When comparing findings to acceptance criteria, use these domain "
+            "thresholds where applicable:"
+        ]
+        if is_chrom:
+            lines += [
+                "  - UV 280 deviation >15% → protein concentration variability",
+                "  - Peak area CV >10% → process reproducibility issue",
+                "  - Rs < 1.5 → peaks not baseline-resolved",
+                "  - N < 2000 → below USP minimum plate count",
+                "  - Aggregate >5% by SEC → exceeds specification",
+            ]
+            lines += [
+                "When first introducing CV or deviation calculations, include the equation:",
+                "  **CV (%) = (s / x̄) × 100** ; **Deviation (%) = ((xᵢ − x̄) / x̄) × 100**",
+            ]
+        if is_ms:
+            lines += [
+                "  - Mass accuracy >50 ppm → potential PTM/glycoform heterogeneity or calibration drift",
+                "  - S/N < 10 → marginal signal quality",
+            ]
+            lines += [
+                "When first citing mass accuracy, include the equation:",
+                "  **Mass accuracy (ppm) = ((m_obs − m_theo) / m_theo) × 10⁶**",
+            ]
+        return "\n".join(lines)
+
     def _build_report_prompt(self, payload: Dict[str, Any]) -> str:
         """Build a self-contained report prompt with all data pre-loaded.
 
@@ -6846,32 +8187,57 @@ class CaptainPipeline:
             except Exception:
                 pass
         if analysis_data:
-            # Compact to avoid token overflow
-            compact = {k: v for k, v in analysis_data.items()
-                       if k in ("findings", "per_group", "per_run_per_stage",
-                                "signal_processing", "spectral_quality",
-                                "anova_p_values", "notes")}
+            # WP-R5: Include ml_modeling, domain_reasoning, secondary_analysis
+            # in addition to core analysis fields so reports can reference them.
+            #
+            # Truncation strategy: preserve high-value reasoning blocks before
+            # applying the budget cap. Extract ml_modeling and domain_reasoning
+            # separately so they are never silently truncated by a large per_group.
+            _priority_keys = ("ml_modeling", "domain_reasoning", "secondary_analysis")
+            _bulk_keys = ("findings", "per_group", "per_run_per_stage",
+                          "signal_processing", "spectral_quality",
+                          "anova_p_values", "notes")
+            priority_blocks = {k: v for k, v in analysis_data.items() if k in _priority_keys}
+            bulk_blocks = {k: v for k, v in analysis_data.items() if k in _bulk_keys}
+
+            # Serialize priority blocks first (always included)
+            priority_json = json.dumps(priority_blocks, indent=2, default=str) if priority_blocks else ""
+            priority_chars = len(priority_json)
+
+            # Apply remaining budget to bulk blocks
+            remaining_budget = max(_budget_analysis - priority_chars - 50, 500)
+            bulk_json = json.dumps(bulk_blocks, indent=2, default=str)[:remaining_budget]
+
+            combined_json = bulk_json
+            if priority_json:
+                combined_json = bulk_json.rstrip() + "\n" + priority_json
+
             sections.append(
-                f"## Analysis Summary\n```json\n"
-                f"{json.dumps(compact, indent=2, default=str)[:_budget_analysis]}\n```\n"
+                f"## Analysis Summary\n```json\n{combined_json}\n```\n"
             )
 
-        # Cross-validation
+        # Cross-validation — WP-R5: embed actual verified claims, not just count
         xval = payload.get("cross_validation", {})
         if xval and not xval.get("skipped"):
             verified = xval.get("verified_claims", [])[:10]
             gaps = xval.get("gaps", [])
-            sections.append(
-                f"## Cross-Validation\n- Verified claims: {len(verified)}\n"
-                f"- Gaps: {gaps}\n"
-            )
+            xval_lines = [f"## Cross-Validation\n- Verified claims: {len(verified)}\n"]
+            if verified:
+                xval_snippet = json.dumps(verified[:5], indent=2, default=str)[:2000]
+                xval_lines.append(
+                    f"### Top Verified Claims\n```json\n{xval_snippet}\n```\n"
+                )
+            if gaps:
+                xval_lines.append(f"- Gaps: {gaps}\n")
+            sections.append("".join(xval_lines))
 
-        # Domain hints
+        # Domain hints + WP-R2: domain-conditional threshold block
         hints = payload.get("domain_hints", {})
         if hints:
             domains = [k for k, v in hints.items() if v is True
                        and k in ("chromatography", "mass_spectrometry")]
             sections.append(f"## Domain: {', '.join(domains) or 'general'}\n")
+        threshold_block = self._report_threshold_block(hints)
 
         # Plot list — with content descriptions from analysis summary
         artifacts = payload.get("analysis_artifacts", [])
@@ -6921,8 +8287,8 @@ class CaptainPipeline:
                 "\n## Instructions\n"
                 "Write the report as Markdown with ALL of the following sections:\n"
                 "\n### Required Sections:\n"
-                "1. **Executive Summary** — 2-3 sentences: what data was analysed, "
-                "key finding, overall quality assessment\n"
+                "1. **Executive Summary** — 2-3 sentences synthesising what the data "
+                "shows and its scientific significance (not a section index).\n"
                 "2. **Data Overview** — Table: file name, rows, columns, data domain. "
                 "Source: cleaning summary\n"
                 "3. **Cleaning Summary** — What was removed and why\n"
@@ -6931,8 +8297,8 @@ class CaptainPipeline:
                 "   - State the quantitative observation with exact values and units\n"
                 "   - Reference the supporting figure by number and describe what "
                 "it shows visually\n"
-                "   - Compare to a reference range or acceptance criterion\n"
-                "   - Interpret the biological or process significance and possible "
+                f"   - {threshold_block}\n"
+                "   - Interpret the scientific or process significance and possible "
                 "root cause for any deviation\n"
                 "   Group findings into subsections by theme (e.g. reproducibility, "
                 "outliers, correlations). If the number of individual findings is "
@@ -6940,10 +8306,12 @@ class CaptainPipeline:
                 "one individually.\n"
                 "5. **Figures** — For each key figure, write a paragraph: what it "
                 "displays, quantitative pattern, comparison to expected values, "
-                "biological interpretation\n"
-                "6. **Cross-Validation** — Verified claims, mismatches, gaps\n"
+                "scientific interpretation\n"
+                "6. **Cross-Validation** — Verified claims with recomputed values, "
+                "mismatches, gaps\n"
                 "7. **Limitations**\n"
-                "8. **Recommendations**\n"
+                "8. **Recommendations** — Must reference specific findings with "
+                "quantitative values; do not give generic advice\n"
                 "\nIMPORTANT: Only report metrics that appear in the data above. "
                 "Do NOT fabricate values that are not present in the summaries.\n"
                 "\nReturn the Markdown directly (no JSON wrapper needed)."
@@ -7033,62 +8401,9 @@ class CaptainPipeline:
         if not report_md.strip():
             report_md = self._backfill_report(payload, label)
 
-        # ── Claim-evidence evaluation (VLM, max 2 revision rounds) ────
-        if report_md.strip() and self._vlm_available():
-            plot_dir = payload.get("output_dir", "")
-            for revision_round in range(2):
-                claim_checks = self._run_claim_evidence_evaluator(
-                    report_md, plot_dir,
-                    f"{label}__claim_r{revision_round}",
-                )
-                must_fix_claims = [
-                    c for c in claim_checks
-                    if not c.passed and c.severity == Severity.MUST_FIX
-                ]
-                if not must_fix_claims:
-                    break  # all claims consistent — accept report
-
-                # Build revision instructions from claim failures
-                revision_parts = [
-                    "CLAIM-EVIDENCE REVISION REQUIRED. The following figure "
-                    "references do not match the visual evidence in the plots:"
-                ]
-                for cf in must_fix_claims[:5]:
-                    revision_parts.append(f"  - {cf.detail}")
-                    revision_parts.append(f"    Fix: {cf.fix_instruction}")
-                revision_text = "\n".join(revision_parts)
-
-                try:
-                    from autogen.oai import OpenAIWrapper
-
-                    cfg = self._base_config_dict()
-                    cfg["temperature"] = 0.2
-                    client = OpenAIWrapper(**cfg)
-                    response = client.create(
-                        messages=[
-                            {"role": "system", "content": REPORT_WRITER_PROMPT},
-                            {"role": "user", "content": report_prompt},
-                            {"role": "assistant", "content": report_md},
-                            {"role": "user", "content": revision_text},
-                        ],
-                    )
-                    revised = strip_think_tokens(
-                        response.choices[0].message.content or ""
-                    )
-                    parsed_r = parse_json_tolerant(revised)
-                    if isinstance(parsed_r, dict) and parsed_r.get("report_markdown"):
-                        report_md = parsed_r["report_markdown"]
-                    elif revised.strip().startswith("#") and len(revised.strip()) > 200:
-                        report_md = revised
-                    else:
-                        break  # revision produced garbage — keep previous version
-                    logger.info(
-                        "Report revised (round %d, %d claim fixes) for %s",
-                        revision_round + 1, len(must_fix_claims), label,
-                    )
-                except Exception as exc:
-                    logger.warning("Report revision failed (round %d): %s", revision_round + 1, exc)
-                    break
+        # WP-R quality gates (narrative critic, numerical consistency,
+        # grounding revision) are now in report_pipeline via report_quality.py.
+        # Captain pipeline reports are fallback-only — no quality gates applied.
 
         write_text(output_path, report_md)
 
@@ -7096,6 +8411,129 @@ class CaptainPipeline:
             "report_path": str(output_path),
             "report_markdown": report_md,
         }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Report quality helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_grounding_rate(report_md: str) -> Optional[float]:
+        """Fraction of analytical paragraphs containing at least one number.
+
+        WP-R4: Mirrors evaluation/deterministic.compute_quantitative_grounding_rate()
+        so the metric can be used in-loop during _run_report_stage().
+        """
+        if not report_md:
+            return None
+        lines = report_md.split("\n")
+        analytical_start = 0
+        for i, line in enumerate(lines):
+            if line.startswith("## ") and any(
+                kw in line.lower()
+                for kw in ("result", "finding", "data", "analysis",
+                           "discussion", "quality", "material", "method")
+            ):
+                analytical_start = i
+                break
+        analytical_text = "\n".join(lines[analytical_start:])
+        paragraphs = [
+            p.strip() for p in analytical_text.split("\n\n")
+            if len(p.strip()) > 50
+            and not p.strip().startswith("#")
+            and not p.strip().startswith("|")
+        ]
+        if not paragraphs:
+            return None
+        _num_re = re.compile(r"\b\d+[\.,]?\d*\b")
+        grounded = sum(1 for p in paragraphs if _num_re.search(p))
+        return round(grounded / len(paragraphs), 4)
+
+    @staticmethod
+    def _check_numerical_consistency(
+        report_md: str,
+        analysis_data: Dict[str, Any],
+        cleaning_data: Dict[str, Any],
+    ) -> List[CheckResult]:
+        """Pure-Python heuristic: flag numbers in report that contradict JSON artifacts.
+
+        WP-R6: Extracts metric=value patterns from report prose and compares against
+        per_group and findings in analysis_data. Returns SHOULD_FIX CheckResults for
+        explicit contradictions. Uncorrelated numbers (e.g. figure numbers, dates,
+        literature citations) are not flagged.
+        """
+        issues: List[CheckResult] = []
+        if not report_md or not analysis_data:
+            return issues
+
+        # Build a flat lookup of metric → value from per_group means
+        per_group = analysis_data.get("per_group", analysis_data.get("per_run_per_stage", {}))
+        metric_means: Dict[str, float] = {}
+        if isinstance(per_group, dict):
+            metric_sums: Dict[str, List[float]] = {}
+            for gv in per_group.values():
+                if isinstance(gv, dict):
+                    for mk, mv in gv.items():
+                        if isinstance(mv, (int, float)):
+                            metric_sums.setdefault(mk, []).append(float(mv))
+            for mk, vals in metric_sums.items():
+                metric_means[mk.lower()] = sum(vals) / len(vals)
+
+        # Simple cleaning stats lookup
+        rows_before = cleaning_data.get("rows_before")
+        rows_after = cleaning_data.get("rows_after")
+        if isinstance(rows_before, (int, float)):
+            metric_means["rows_before"] = float(rows_before)
+        if isinstance(rows_after, (int, float)):
+            metric_means["rows_after"] = float(rows_after)
+
+        if not metric_means:
+            return issues
+
+        # Pattern: metric_name=<number> or "metric_name of <number>" (case-insensitive)
+        _kv_re = re.compile(
+            r"(?:([a-z_][a-z0-9_]*)\s*[=:]\s*)(\d+[\.,]?\d*(?:\s*%)?)",
+            re.IGNORECASE,
+        )
+        tolerance = 0.05  # ±5% tolerance for floating-point comparisons
+
+        for match in _kv_re.finditer(report_md):
+            key = match.group(1).lower().strip()
+            raw_val = match.group(2).replace(",", ".").replace("%", "").strip()
+            try:
+                reported_val = float(raw_val)
+            except ValueError:
+                continue
+
+            # Find the closest metric name in our lookup
+            exact = metric_means.get(key)
+            if exact is None:
+                # Try partial match
+                for mk in metric_means:
+                    if key in mk or mk in key:
+                        exact = metric_means[mk]
+                        break
+
+            if exact is None or exact == 0:
+                continue
+
+            # Check for contradiction (outside ±5% tolerance)
+            if abs(reported_val - exact) / abs(exact) > tolerance:
+                issues.append(CheckResult(
+                    name=f"numerical_consistency_{key}",
+                    passed=False,
+                    severity=Severity.SHOULD_FIX,
+                    category=CheckCategory.CONTENT_QUALITY,
+                    detail=(
+                        f"Report states '{key}={reported_val}' but data shows "
+                        f"{key}≈{exact:.4g} (difference > {tolerance*100:.0f}% tolerance)."
+                    ),
+                    fix_instruction=(
+                        f"Correct the value of '{key}' to match the data: "
+                        f"use {exact:.4g} instead of {reported_val}."
+                    ),
+                ))
+
+        return issues
 
     # ──────────────────────────────────────────────────────────────────
     # Deterministic report backfill
@@ -7172,7 +8610,11 @@ class CaptainPipeline:
                 sections.append(f"- {p}\n")
 
         # ── Domain-Specific Interpretation ──
-        # Skip interpretation entirely when analysis was skipped or produced no data
+        # WP-R2: Gate biologics interpretation on domain_hints; use generic
+        # deviation reporter for non-chromatography / non-MS datasets.
+        domain_hints = payload.get("domain_hints", {})
+        is_chrom_bf = bool(domain_hints.get("chromatography"))
+        is_ms_bf = bool(domain_hints.get("mass_spectrometry"))
         per_group = analysis_data.get("per_group", analysis_data.get("per_run_per_stage", {}))
         if not analysis_skipped and per_group and isinstance(per_group, dict) and len(per_group) >= 2:
             sections.append("## 4. Interpretation\n")
@@ -7199,58 +8641,72 @@ class CaptainPipeline:
                 most_dev = max(kv_list, key=lambda x: abs(x[1] - mean_val))
                 dev_pct = abs(most_dev[1] - mean_val) / abs(mean_val) * 100
 
-                # Domain interpretation rules
+                # Domain interpretation rules — only apply biologics rules when domain matches
                 interpretation = ""
                 ml = metric.lower()
-                if "uv_280" in ml or "absorbance" in ml:
-                    if dev_pct > 15:
+                if is_chrom_bf or is_ms_bf:
+                    # Biologics / chromatography / MS thresholds
+                    if "uv_280" in ml or "absorbance" in ml:
+                        if dev_pct > 15:
+                            interpretation = (
+                                "Deviation >15% in UV absorbance suggests protein "
+                                "concentration variability, possibly due to column "
+                                "loading inconsistency or protein degradation."
+                            )
+                        else:
+                            interpretation = "UV absorbance within acceptable range."
+                    elif "area" in ml or "auc" in ml:
+                        if cv_pct > 10:
+                            interpretation = (
+                                f"CV of {cv_pct:.1f}% across runs indicates process "
+                                "reproducibility concern. Typical acceptance: CV < 10%."
+                            )
+                        else:
+                            interpretation = f"CV of {cv_pct:.1f}% indicates good reproducibility."
+                    elif "mass" in ml and "kda" in ml:
+                        if dev_pct > 2:
+                            interpretation = (
+                                "Mass deviation >2% from group mean may indicate "
+                                "post-translational modification, glycoform heterogeneity, "
+                                "or calibration drift."
+                            )
+                        else:
+                            interpretation = "Mass consistency within expected range."
+                    elif "accuracy" in ml and "ppm" in ml:
+                        if mean_val > 50:
+                            interpretation = (
+                                f"Mean mass accuracy of {mean_val:.0f} ppm exceeds "
+                                "typical intact mass tolerance (<50 ppm). Check calibration."
+                            )
+                    elif "sn" in ml or "signal" in ml:
+                        if mean_val < 10:
+                            interpretation = (
+                                f"Mean S/N of {mean_val:.1f} — consider higher loading "
+                                "or longer acquisition for improved sensitivity."
+                            )
+                    elif "resolution" in ml or "rs" == ml:
+                        if mean_val < 1.5:
+                            interpretation = (
+                                f"Mean Rs of {mean_val:.2f} indicates incomplete "
+                                "baseline separation. Gradient optimization may help."
+                            )
+                    elif "plate" in ml:
+                        if mean_val < 2000:
+                            interpretation = (
+                                f"Mean plate count of {mean_val:.0f} is below USP "
+                                "minimum (N > 2000). Column may need replacement."
+                            )
+                else:
+                    # Generic deviation reporter for non-biologics domains
+                    if cv_pct > 20:
                         interpretation = (
-                            "Deviation >15% in UV absorbance suggests protein "
-                            "concentration variability, possibly due to column "
-                            "loading inconsistency or protein degradation."
+                            f"CV of {cv_pct:.1f}% indicates high variability across groups "
+                            f"(most deviant: {most_dev[0]}, {dev_pct:.1f}% from mean)."
                         )
-                    else:
-                        interpretation = "UV absorbance within acceptable range."
-                elif "area" in ml or "auc" in ml:
-                    if cv_pct > 10:
+                    elif dev_pct > 30:
                         interpretation = (
-                            f"CV of {cv_pct:.1f}% across runs indicates process "
-                            "reproducibility concern. Typical acceptance: CV < 10%."
-                        )
-                    else:
-                        interpretation = f"CV of {cv_pct:.1f}% indicates good reproducibility."
-                elif "mass" in ml and "kda" in ml:
-                    if dev_pct > 2:
-                        interpretation = (
-                            "Mass deviation >2% from group mean may indicate "
-                            "post-translational modification, glycoform heterogeneity, "
-                            "or calibration drift."
-                        )
-                    else:
-                        interpretation = "Mass consistency within expected range."
-                elif "accuracy" in ml and "ppm" in ml:
-                    if mean_val > 50:
-                        interpretation = (
-                            f"Mean mass accuracy of {mean_val:.0f} ppm exceeds "
-                            "typical intact mass tolerance (<50 ppm). Check calibration."
-                        )
-                elif "sn" in ml or "signal" in ml:
-                    if mean_val < 10:
-                        interpretation = (
-                            f"Mean S/N of {mean_val:.1f} — consider higher loading "
-                            "or longer acquisition for improved sensitivity."
-                        )
-                elif "resolution" in ml or "rs" == ml:
-                    if mean_val < 1.5:
-                        interpretation = (
-                            f"Mean Rs of {mean_val:.2f} indicates incomplete "
-                            "baseline separation. Gradient optimization may help."
-                        )
-                elif "plate" in ml:
-                    if mean_val < 2000:
-                        interpretation = (
-                            f"Mean plate count of {mean_val:.0f} is below USP "
-                            "minimum (N > 2000). Column may need replacement."
+                            f"Group '{most_dev[0]}' deviates {dev_pct:.1f}% from the group "
+                            "mean, which may warrant further investigation."
                         )
 
                 if interpretation:
@@ -7617,6 +9073,22 @@ class CaptainPipeline:
                 cross_val = {"skipped": True, "reason": "stage_disabled_by_context"}
                 logger.info("Cross-validation stage skipped (not in RunPlan)")
 
+            # Write verified_claims to disk so cross_validation/ directory is populated.
+            # This is unconditional — claims belong on disk regardless of upstream
+            # gate status, so downstream tools and humans can inspect them.
+            if not cross_val.get("skipped"):
+                _cv_dir = file_root / "cross_validation"
+                _cv_dir.mkdir(parents=True, exist_ok=True)
+                safe_write_json(
+                    _cv_dir / "claims.json",
+                    {
+                        "verified_claims": cross_val.get("verified_claims", []),
+                        "consistent": cross_val.get("consistent"),
+                        "conflicts": cross_val.get("conflicts", []),
+                        "gaps": cross_val.get("gaps", []),
+                    },
+                )
+
             # ── Stage 4: Per-file report ──
             if self._stage_enabled("report"):
                 # Read actual analysis_summary.json from disk (not LLM text)
@@ -7855,6 +9327,7 @@ class CaptainPipeline:
             "quality_review": quality_review,
             "visual_review_count": len(visual_review),
             "judge_input_path": str(judge_input_path),
+            "run_config": self.run_config.to_dict(),
         }
         manifest_path = self.outputs_root / f"manifest_{batch_id}.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")

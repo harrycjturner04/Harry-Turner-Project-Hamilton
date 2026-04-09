@@ -40,3 +40,5 @@ evaluation_config.yaml
 Evaluation/
 
 diagrams/
+docs/critic_system_audit.md
+docs/

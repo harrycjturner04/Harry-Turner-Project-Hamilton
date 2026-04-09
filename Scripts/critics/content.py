@@ -51,4 +51,5 @@ class ContentCritic(CriticModule):
             ctx.stage_name,
             artifacts_summary,
             f"{ctx.label}__content_eval",
+            previous_content_checks=ctx.previous_content_checks,
         )

@@ -141,26 +141,45 @@ class CriticRegistry:
             checks = critic.safe_evaluate(ctx)
 
             # De-duplicate interpretation depth: if the content evaluator
-            # already flagged interpretation_depth as MUST_FIX, downgrade
+            # already flagged domain_interpretation as MUST_FIX, downgrade
             # the analytical depth critic's bare_deviations check to
             # SHOULD_FIX to avoid double-penalising the same gap.
+            # Pass C: also downgrade depth__missing_group_comparison when
+            # per_group_depth or statistical_rigor already flagged.
             if critic.name == "analytical_depth":
+                _content_checks = all_checks.get(CheckCategory.CONTENT_QUALITY, [])
                 _content_flagged_interp = any(
-                    c.name == "interpretation_depth"
+                    c.name == "domain_interpretation"
                     and c.severity == Severity.MUST_FIX
-                    for c in all_checks.get(CheckCategory.CONTENT_QUALITY, [])
+                    for c in _content_checks
                 )
-                if _content_flagged_interp:
-                    for c in checks:
-                        if (
-                            c.name == "depth__bare_deviations"
-                            and c.severity == Severity.MUST_FIX
-                        ):
-                            c.severity = Severity.SHOULD_FIX
-                            logger.debug(
-                                "Downgraded depth__bare_deviations to SHOULD_FIX "
-                                "(interpretation_depth already flagged by content critic)"
-                            )
+                _content_flagged_group = any(
+                    c.name in ("per_group_depth", "statistical_rigor")
+                    and c.severity == Severity.MUST_FIX
+                    for c in _content_checks
+                )
+                for c in checks:
+                    if (
+                        c.name == "depth__bare_deviations"
+                        and c.severity == Severity.MUST_FIX
+                        and _content_flagged_interp
+                    ):
+                        c.severity = Severity.SHOULD_FIX
+                        logger.debug(
+                            "Downgraded depth__bare_deviations to SHOULD_FIX "
+                            "(domain_interpretation already flagged by content critic)"
+                        )
+                    elif (
+                        c.name == "depth__missing_group_comparison"
+                        and c.severity == Severity.MUST_FIX
+                        and _content_flagged_group
+                    ):
+                        c.severity = Severity.SHOULD_FIX
+                        logger.debug(
+                            "Downgraded depth__missing_group_comparison to SHOULD_FIX "
+                            "(per_group_depth/statistical_rigor already flagged by "
+                            "content critic)"
+                        )
 
             all_checks.setdefault(critic.category, []).extend(checks)
             ctx.evaluators_ran[critic.name] = bool(checks)

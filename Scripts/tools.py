@@ -93,6 +93,9 @@ class GateResult:
     # WP-C2: Targeted refinement directives
     refinement_directives: List["RefinementDirective"] = field(default_factory=list)
     quality_breakdown: Optional["QualityScoreBreakdown"] = None  # WP-C1: per-dimension scores
+    # Pass C: Regression firewall — set when a retry caused net regression
+    net_regression: bool = False              # True if more checks regressed than improved
+    regressed_checks: List[str] = field(default_factory=list)  # names of PASS→FAIL checks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -103,6 +106,7 @@ class GateResult:
 class RefinementScope(str, Enum):
     """Scope of a targeted refinement action — from most targeted to broadest."""
     PLOT_FIX = "plot_fix"            # fix specific plots (existing)
+    ALIGNMENT_FIX = "alignment_fix"  # deterministic figure_ref patching
     FINDING_FIX = "finding_fix"      # regenerate specific findings
     GAP_FILL = "gap_fill"            # add missing analytical dimension
     FULL_RERUN = "full"              # full CaptainAgent re-run (existing)
@@ -129,7 +133,7 @@ class IssueTracker:
     issue_name: str
     first_seen_attempt: int
     consecutive_count: int = 1
-    max_consecutive: int = 4
+    max_consecutive: int = 2
     resolved: bool = False
 
     @property
@@ -153,9 +157,9 @@ class QualityScoreBreakdown:
 # Expected criteria counts per stage (from rubric definitions in prompts.py)
 _EXPECTED_CRITERIA_COUNT: Dict[str, int] = {
     "cleaning": 4,        # justification, conservatism, preservation, informativeness
-    "analysis": 8,        # per_group_depth, domain_methods, plot_diversity, insight_quality,
-                          # interpretation_depth, statistical_rigor, domain_contribution,
-                          # context_coverage
+    "analysis": 7,        # per_group_depth, domain_methods, plot_diversity,
+                          # domain_interpretation, statistical_rigor,
+                          # domain_contribution, context_coverage
     "cross_validation": 3, # recomputation, tolerance, claim_selection
 }
 
@@ -275,11 +279,18 @@ def compute_quality_breakdown(
     evaluators_ran: Optional[Dict[str, bool]] = None,
 ) -> QualityScoreBreakdown:
     """Compute per-dimension quality scores for enhanced trajectory tracking."""
+    # Cosmetic plot checks always pass (passed=True) and dilute the visual score,
+    # inflating it even when MUST_FIX visual failures are present.  Score only on
+    # scientific_validity and statistical_completeness criteria.
+    _non_cosmetic_plot_checks = [
+        c for c in verdict.plot_checks
+        if not c.detail.startswith("[cosmetic]")
+    ]
     return QualityScoreBreakdown(
         overall=compute_quality_score(verdict, evaluators_ran=evaluators_ran),
         structural=_score_check_list(verdict.structural_checks),
         content=_score_check_list(verdict.content_checks),
-        visual=_score_check_list(verdict.plot_checks),
+        visual=_score_check_list(_non_cosmetic_plot_checks),
     )
 
 
@@ -1156,45 +1167,7 @@ def structural_gate(
                         detail="per_run_per_stage or per_group key present",
                     ))
 
-                # ── domain_reasoning completeness ──
-                dr = data.get("domain_reasoning", {})
-                if not isinstance(dr, dict):
-                    dr = {}
-                mods = dr.get("plan_modifications_applied", [])
-                obs = dr.get("unexpected_observations", [])
-                dr_missing = []
-                if not mods:
-                    dr_missing.append("plan_modifications_applied is empty")
-                if not obs:
-                    dr_missing.append("unexpected_observations is empty")
-                if dr_missing:
-                    checks.append(CheckResult(
-                        name="domain_reasoning_completeness",
-                        passed=False,
-                        severity=Severity.SHOULD_FIX,
-                        category=CheckCategory.STRUCTURAL,
-                        detail=(
-                            "domain_reasoning incomplete: "
-                            + "; ".join(dr_missing)
-                        ),
-                        fix_instruction=(
-                            "Populate 'domain_reasoning' in analysis_summary.json. "
-                            "'plan_modifications_applied' should list at least one "
-                            "adaptation made during analysis. "
-                            "'unexpected_observations' should list at least one "
-                            "observation that was not anticipated."
-                        ),
-                    ))
-                else:
-                    checks.append(CheckResult(
-                        name="domain_reasoning_completeness",
-                        passed=True,
-                        category=CheckCategory.STRUCTURAL,
-                        detail=(
-                            f"domain_reasoning present: {len(mods)} modification(s), "
-                            f"{len(obs)} observation(s)"
-                        ),
-                    ))
+                # domain_reasoning completeness is handled by StructuralCritic._check_domain_reasoning()
 
             except json.JSONDecodeError:
                 checks.append(CheckResult(
@@ -1254,7 +1227,7 @@ def quality_gate(
     previous_verdict: Optional[StageVerdict] = None,
     sf_accumulation_threshold: int = 4,
     stall_count: int = 0,
-    issue_stall_max_consecutive: int = 4,
+    issue_stall_max_consecutive: int = 2,
 ) -> GateResult:
     """Deterministic gate decision based on aggregated check results.
 
@@ -1323,18 +1296,28 @@ def quality_gate(
 
     # Only advisory issues — but check accumulation threshold first.
     # Too many SHOULD_FIX issues collectively indicate inadequate quality.
+    # PLOT_QUALITY SHOULD_FIX are excluded from this count: they are noisy
+    # VLM aesthetic opinions on individual plots (one per plot), and with
+    # large plot counts they will always exceed any reasonable threshold.
+    # Plot-quality issues are already handled by the MUST_FIX / plot-fix
+    # path when they are severe; SHOULD_FIX plot opinions are advisory only.
     if not must_fix:
-        sf_count = len(should_fix)
+        non_plot_sf = [
+            c for c in should_fix
+            if c.category != CheckCategory.PLOT_QUALITY
+        ]
+        sf_count = len(non_plot_sf)
         if sf_count >= sf_accumulation_threshold and verdict.attempt < max_retries:
             verdict.overall_passed = False
             verdict.gate_decision = "retry_accumulated_sf"
             return _make_result(
                 status="failed", verdict=verdict,
                 retry_tier="full",
-                retry_instructions=_build_retry_text(should_fix),
+                retry_instructions=_build_retry_text(non_plot_sf),
                 warnings=[
-                    f"{sf_count} SHOULD_FIX issues accumulated "
-                    f"(threshold: {sf_accumulation_threshold})"
+                    f"{sf_count} non-plot SHOULD_FIX issues accumulated "
+                    f"(threshold: {sf_accumulation_threshold}; "
+                    f"{len(should_fix) - sf_count} plot-quality SHOULD_FIX excluded)"
                 ],
             )
         # Below threshold or budget exhausted — pass with warnings
@@ -1372,6 +1355,27 @@ def quality_gate(
             ] + [c.detail for c in must_fix],
         )
 
+    # ── Pass C: Regression detection ──
+    # Compare against previous verdict to detect net regression (more checks
+    # went PASS→FAIL than FAIL→PASS).  This signals the retry loop to
+    # consider rolling back artifacts rather than continuing with worse output.
+    _net_regression = False
+    _regressed_checks: List[str] = []
+    if previous_verdict is not None:
+        _prev_all = (previous_verdict.structural_checks + previous_verdict.content_checks
+                     + previous_verdict.plot_checks + previous_verdict.claim_checks)
+        _curr_all = (verdict.structural_checks + verdict.content_checks
+                     + verdict.plot_checks + verdict.claim_checks)
+        _prev_passed = {c.name for c in _prev_all if c.passed}
+        _prev_failed = {c.name for c in _prev_all if not c.passed}
+        _curr_passed = {c.name for c in _curr_all if c.passed}
+        _curr_failed = {c.name for c in _curr_all if not c.passed}
+        _regressed = _prev_passed & _curr_failed
+        _improved = _prev_failed & _curr_passed
+        if _regressed and len(_regressed) > len(_improved):
+            _net_regression = True
+            _regressed_checks = sorted(_regressed)
+
     # Route to appropriate retry tier and build refinement directives
     plot_only = verdict.plot_only_failures()
     content = verdict.content_failures()
@@ -1387,16 +1391,29 @@ def quality_gate(
             instructions=_build_retry_text(plot_only),
         ))
 
-    # 2. Finding-specific fixes (content MUST_FIX with identifiable ref)
+    # 1.5 Plot-finding alignment fix (deterministic, no LLM)
+    _alignment_fixes = [
+        c for c in must_fix
+        if c.name == "exec__plot_finding_alignment"
+    ]
+    if _alignment_fixes:
+        directives.append(RefinementDirective(
+            scope=RefinementScope.ALIGNMENT_FIX,
+            check_results=_alignment_fixes,
+            instructions=_build_retry_text(_alignment_fixes),
+        ))
+
+    # 2. Finding-specific fixes (content MUST_FIX — exclude alignment which
+    #    needs a structural patch, not an LLM finding rewrite)
     _finding_fixes = [
         c for c in must_fix
-        if c.category == CheckCategory.CONTENT_QUALITY and c.ref
+        if c.category == CheckCategory.CONTENT_QUALITY
+        and c.name != "exec__plot_finding_alignment"
     ]
     if _finding_fixes:
         directives.append(RefinementDirective(
             scope=RefinementScope.FINDING_FIX,
             check_results=_finding_fixes,
-            target_ref=_finding_fixes[0].ref,
             instructions=_build_retry_text(_finding_fixes),
         ))
 
@@ -1436,12 +1453,15 @@ def quality_gate(
 
     verdict.overall_passed = False
     verdict.gate_decision = "retry"
-    return _make_result(
+    _result = _make_result(
         status="failed", verdict=verdict,
         retry_tier=retry_tier,
         retry_instructions=retry_text,
         refinement_directives=directives,
     )
+    _result.net_regression = _net_regression
+    _result.regressed_checks = _regressed_checks
+    return _result
 
 
 _CATEGORY_PRIORITY = {
@@ -1452,12 +1472,23 @@ _CATEGORY_PRIORITY = {
 
 _MAX_RETRY_ITEMS = 10
 
+# Pass C: Check redundancy map — when a higher-priority check is present,
+# the lower-priority check's retry instruction is suppressed to avoid
+# contradictory guidance.  Key = suppressed check, value = set of checks
+# that subsume it.
+_CHECK_SUBSUMPTION: Dict[str, set] = {
+    "depth__bare_deviations": {"domain_interpretation"},
+    "depth__missing_group_comparison": {"per_group_depth", "statistical_rigor"},
+    "exec__finding_data_mismatch": {"domain_interpretation"},
+}
+
 
 def _build_retry_text(failures: List[CheckResult]) -> str:
     """Build structured retry instructions from a list of failing checks.
 
-    Caps to the top 5 most critical issues (structural > content > visual)
-    and instructs the agent to preserve passing aspects.
+    Caps to the top 10 most critical issues (structural > content > visual)
+    and instructs the agent to preserve passing aspects.  Pass C: suppresses
+    redundant checks when a higher-priority check covers the same dimension.
     """
     if not failures:
         return ""
@@ -1470,8 +1501,27 @@ def _build_retry_text(failures: List[CheckResult]) -> str:
             0 if c.severity == Severity.MUST_FIX else 1,
         ),
     )
-    top = sorted_failures[:_MAX_RETRY_ITEMS]
-    omitted = len(failures) - len(top)
+
+    # Pass C: Deduplicate — suppress checks that are subsumed by
+    # higher-priority checks already in the failure set.
+    _present_names = {c.name for c in sorted_failures}
+    _deduplicated = []
+    _suppressed = []
+    for c in sorted_failures:
+        _subsumers = _CHECK_SUBSUMPTION.get(c.name, set())
+        if _subsumers & _present_names:
+            _suppressed.append(c.name)
+            continue
+        _deduplicated.append(c)
+    if _suppressed:
+        import logging as _logging
+        _logging.getLogger("captain_pipeline").debug(
+            "Retry text: suppressed redundant checks %s (subsumed by present checks)",
+            _suppressed,
+        )
+
+    top = _deduplicated[:_MAX_RETRY_ITEMS]
+    omitted = len(_deduplicated) - len(top)
 
     lines = [f"FOCUS: Address these {len(top)} critical issues. "
              "All other aspects were acceptable — preserve them."]

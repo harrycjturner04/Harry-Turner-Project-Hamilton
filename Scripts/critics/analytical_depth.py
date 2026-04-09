@@ -143,27 +143,45 @@ class AnalyticalDepthCritic(CriticModule):
 
         return checks
 
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_data_profile(ctx: CriticContext) -> Optional[Dict[str, Any]]:
+        """Load data profile from ctx.payload (in-memory) with disk fallback.
+
+        The captain pipeline stores the profile in ``ctx.payload["data_profile"]``
+        during stage setup.  If unavailable (e.g. older pipeline version), we
+        fall back to reading ``data_profile.json`` from the analysis directory.
+        Using the payload ensures a single source of truth shared with all critics.
+        """
+        profile = (ctx.payload or {}).get("data_profile")
+        if isinstance(profile, dict) and profile:
+            return profile
+
+        # Disk fallback
+        asp = (ctx.payload or {}).get("analysis_summary_path", "")
+        if not asp:
+            return None
+        profile_path = Path(asp).parent / "data_profile.json"
+        if not profile_path.exists():
+            return None
+        try:
+            return json.loads(profile_path.read_text("utf-8"))
+        except Exception:
+            return None
+
     def _check_grouping_adequacy(
         self, summary: Dict[str, Any], ctx: CriticContext,
     ) -> List[CheckResult]:
         """Check whether the analysis grouping covers the dataset's key dimensions.
 
-        Loads the data_profile.json produced by the schema profiler and compares
-        the per_group keys against the dimensional structure.  Flags when major
-        analytical dimensions (process_phase, experimental_condition) are absent
-        from the grouping, which usually means the analysis is too coarse.
+        Uses the data_profile from ctx.payload (in-memory, set by captain_pipeline)
+        with a disk fallback, then compares per_group keys against the dimensional
+        structure.  Flags when major analytical dimensions (process_phase,
+        experimental_condition) are absent from the grouping.
         """
-        # Locate data_profile.json (sibling of analysis_summary.json)
-        asp = ctx.payload.get("analysis_summary_path", "")
-        if not asp:
-            return []
-        profile_path = Path(asp).parent / "data_profile.json"
-        if not profile_path.exists():
-            return []
-
-        try:
-            profile_data = json.loads(profile_path.read_text("utf-8"))
-        except Exception:
+        profile_data = self._load_data_profile(ctx)
+        if not profile_data:
             return []
 
         dim_struct = profile_data.get("dimensional_structure", {})
@@ -271,22 +289,14 @@ class AnalyticalDepthCritic(CriticModule):
     ) -> List[CheckResult]:
         """Verify per_group keys match (or are finer-grained than) recommended grouping.
 
-        Loads the data_profile.json and checks whether the per_group key
-        structure in the analysis output contains the recommended grouping
-        column values.  A mismatch (e.g. agent grouped by a different
-        column entirely) is MUST_FIX; a coarser grouping (missing one
-        recommended column) is SHOULD_FIX.
+        Uses the data_profile from ctx.payload (in-memory) with a disk fallback,
+        and checks whether the per_group key structure in the analysis output
+        contains the recommended grouping column values.  A mismatch (e.g.
+        agent grouped by a different column entirely) is MUST_FIX; a coarser
+        grouping (missing one recommended column) is SHOULD_FIX.
         """
-        asp = ctx.payload.get("analysis_summary_path", "")
-        if not asp:
-            return []
-        profile_path = Path(asp).parent / "data_profile.json"
-        if not profile_path.exists():
-            return []
-
-        try:
-            profile_data = json.loads(profile_path.read_text("utf-8"))
-        except Exception:
+        profile_data = self._load_data_profile(ctx)
+        if not profile_data:
             return []
 
         rec_grp = profile_data.get("recommended_grouping")
@@ -384,16 +394,8 @@ class AnalyticalDepthCritic(CriticModule):
         column names. When N contexts exist but fewer than max(2, N-1) are
         referenced, flags as SHOULD_FIX.
         """
-        asp = ctx.payload.get("analysis_summary_path", "")
-        if not asp:
-            return []
-        profile_path = Path(asp).parent / "data_profile.json"
-        if not profile_path.exists():
-            return []
-
-        try:
-            profile_data = json.loads(profile_path.read_text("utf-8"))
-        except Exception:
+        profile_data = self._load_data_profile(ctx)
+        if not profile_data:
             return []
 
         dim_struct = profile_data.get("dimensional_structure", {})
@@ -476,15 +478,31 @@ class AnalyticalDepthCritic(CriticModule):
             return []
 
         findings_text = " ".join(finding_text(f) for f in findings).lower()
+        group_names = sorted(str(k) for k in per_group.keys())
+        groups_str = ", ".join(group_names[:10])
+        if len(group_names) > 10:
+            groups_str += f" ... ({len(group_names)} total)"
 
         if n_groups == 2:
-            # Binary design: expect t-test or pairwise comparison
-            has_comparison = any(
+            # Binary design: expect t-test or pairwise comparison.
+            # Use both keyword list and regex patterns to catch common phrasings
+            # that contain word insertions or spacing variants.
+            _kw_match = any(
                 kw in findings_text
                 for kw in ("t-test", "t_test", "ttest", "mann-whitney", "wilcoxon",
-                            "cohen", "effect size", "p-value", "p_value",
-                            "pairwise", "between groups", "compared to")
+                            "cohen", "effect size", "p-value", "p_value", "p value",
+                            "pairwise", "between groups", "compared to",
+                            "statistically significant", "independent t",
+                            "welch", "levene",
+                            "hypothesis test", "significant difference",
+                            "two-sample", "non-parametric", "permutation test",
+                            "brunner", "munzel", "p-val", "significant at",
+                            "rank_biserial", "rank-biserial",
+                            "eta_squared", "eta-squared", "η²")
             )
+            # p-value notation: "p < 0.05", "p=0.03", "p > 0.1", "(p<0.001)" etc.
+            _re_match = bool(re.search(r"p\s*[<>=≤≥]\s*0\.\d", findings_text))
+            has_comparison = _kw_match or _re_match
             if has_comparison:
                 return [CheckResult(
                     name="depth__group_comparison",
@@ -497,20 +515,37 @@ class AnalyticalDepthCritic(CriticModule):
                 passed=False,
                 severity=Severity.MUST_FIX,
                 category=CheckCategory.CONTENT_QUALITY,
-                detail=f"{n_groups} groups present but no t-test or pairwise comparison performed",
+                detail=(
+                    f"{n_groups} groups present ({groups_str}) but no t-test or "
+                    "pairwise comparison found in findings"
+                ),
                 fix_instruction=(
+                    f"Your data has {n_groups} groups: {groups_str}. "
                     "Add a pairwise comparison (scipy.stats.ttest_ind for normal data, "
-                    "scipy.stats.mannwhitneyu otherwise). Report p-value and effect size "
-                    "(Cohen's d). Store results in analysis_summary.json."
+                    "scipy.stats.mannwhitneyu otherwise) comparing the primary metric "
+                    "across these groups. Report the p-value and effect size (Cohen's d) "
+                    "explicitly in a finding. Store results in analysis_summary.json."
                 ),
             )]
 
-        # 3+ groups: expect ANOVA or Kruskal-Wallis
-        has_comparison = any(
+        # 3+ groups: expect ANOVA or Kruskal-Wallis.
+        # Use both keyword list and regex for spacing/word-insertion variants.
+        _kw_match = any(
             kw in findings_text
             for kw in ("anova", "kruskal", "f-test", "f_oneway", "p-value", "p_value",
-                        "group comparison", "between groups", "across groups")
+                        "p value", "group comparison", "between groups", "among groups",
+                        "statistically significant", "friedman", "welch anova",
+                        "dunn", "post-hoc", "posthoc", "tukey", "bonferroni",
+                        "multiple comparison", "nemenyi", "pairwise comparison",
+                        "omnibus", "p-val", "significant at",
+                        "eta_squared", "eta-squared", "epsilon_squared", "η²")
         )
+        # Matches "across all groups", "across the 3 groups", "across groups" etc.
+        _re_match = bool(
+            re.search(r"across\s+\S+\s+groups|across\s+groups|between\s+the\s+groups", findings_text)
+            or re.search(r"p\s*[<>=≤≥]\s*0\.\d", findings_text)
+        )
+        has_comparison = _kw_match or _re_match
         if has_comparison:
             return [CheckResult(
                 name="depth__group_comparison",
@@ -524,10 +559,16 @@ class AnalyticalDepthCritic(CriticModule):
             passed=False,
             severity=Severity.MUST_FIX,
             category=CheckCategory.CONTENT_QUALITY,
-            detail=f"{n_groups} groups present but no ANOVA/Kruskal-Wallis comparison performed",
+            detail=(
+                f"{n_groups} groups present ({groups_str}) but no ANOVA/Kruskal-Wallis "
+                "comparison found in findings"
+            ),
             fix_instruction=(
+                f"Your data has {n_groups} groups: {groups_str}. "
                 "Add a group comparison test (scipy.stats.f_oneway for normal data, "
-                "scipy.stats.kruskal otherwise) across the groups. Report actual p-values. "
+                "scipy.stats.kruskal otherwise) comparing the primary metric across "
+                "these groups. Report actual p-values explicitly in a finding (e.g. "
+                "'Kruskal-Wallis test across groups: p=0.003'). "
                 "Store results in anova_p_values dict in analysis_summary.json."
             ),
         )]
@@ -693,10 +734,16 @@ class AnalyticalDepthCritic(CriticModule):
                     category=CheckCategory.CONTENT_QUALITY,
                     detail=parsed.get("detail", "All findings include interpretive context"),
                 )]
+            # Graduate severity to match heuristic: majority bare → MUST_FIX
+            _total = int(parsed.get("total", len(findings))) or len(findings)
+            _interp_severity = (
+                Severity.MUST_FIX if bare_count / _total > 0.5
+                else Severity.SHOULD_FIX
+            )
             return [CheckResult(
                 name="depth__bare_deviations",
                 passed=False,
-                severity=Severity.SHOULD_FIX,
+                severity=_interp_severity,
                 category=CheckCategory.CONTENT_QUALITY,
                 detail=parsed.get("detail", f"{bare_count}/{len(findings)} findings lack interpretation"),
                 fix_instruction=(

@@ -13,12 +13,19 @@ Quick start::
     python -m Scripts.evaluation full \\
         --glob "Outputs/slurm_*" --baseline "baseline-v2"
 
-Subcommands: evaluate, pairwise, ablation, export, rankings, full.
+Subcommands: deterministic, evaluate, pairwise, ablation, repeatability,
+             export, rankings, full.
 Run ``python -m Scripts.evaluation --help`` for details.
 """
 
 from .config import EvalConfig, JudgeModelSpec, load_config
+from .deterministic import ingest_run_deterministic
 from .registry import RunRecord, discover_runs, group_by_config
+from .statistics import (
+    coefficient_of_variation,
+    compute_krippendorff_per_criterion,
+    krippendorff_alpha,
+)
 from .storage import EvalDB
 
 __all__ = [
@@ -29,4 +36,8 @@ __all__ = [
     "discover_runs",
     "group_by_config",
     "EvalDB",
+    "ingest_run_deterministic",
+    "coefficient_of_variation",
+    "krippendorff_alpha",
+    "compute_krippendorff_per_criterion",
 ]

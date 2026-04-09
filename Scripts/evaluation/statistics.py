@@ -3,7 +3,7 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -40,6 +40,14 @@ class ComparisonResult:
     n_permutations: int
     significant_at_005: bool
     correction_method: str
+    values_a: List[float] = None  # type: ignore[assignment]
+    values_b: List[float] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.values_a is None:
+            self.values_a = []
+        if self.values_b is None:
+            self.values_b = []
 
 
 def bootstrap_ci(
@@ -214,7 +222,271 @@ def compare_configurations(
         n_permutations=n_permutations,
         significant_at_005=u_p < 0.05,
         correction_method="none",
+        values_a=list(stats_a.values),
+        values_b=list(stats_b.values),
     )
+
+
+def coefficient_of_variation(values: List[float]) -> Optional[float]:
+    """Coefficient of variation (std / mean).
+
+    Returns None if N < 2 or mean is zero.
+    Interpretation: CoV < 0.15 is stable; > 0.25 is high variance.
+    """
+    if len(values) < 2:
+        return None
+    arr = np.array(values, dtype=float)
+    mean = float(np.mean(arr))
+    if mean == 0:
+        return None
+    std = float(np.std(arr, ddof=1))
+    return round(std / mean, 4)
+
+
+def krippendorff_alpha(
+    ratings: List[List[Optional[float]]],
+    level_of_measurement: str = "interval",
+) -> float:
+    """Compute Krippendorff's alpha for inter-rater reliability.
+
+    Measures agreement between multiple raters (judges) across units (reports).
+
+    Args:
+        ratings: Matrix of shape (n_raters, n_units).
+                 Use None for missing values.
+        level_of_measurement: 'interval' (default) or 'ordinal'.
+            'interval' assumes equal spacing between score values.
+            'ordinal' uses rank-based distance.
+
+    Returns:
+        Alpha value in [-1, 1]. Alpha >= 0.8 is good, 0.6-0.8 is
+        acceptable, < 0.6 is unreliable for the given criterion.
+
+    Reference:
+        Krippendorff, K. (2004). Content analysis: An introduction to
+        its methodology (2nd ed.). Sage.
+    """
+    if not ratings or not ratings[0]:
+        return float("nan")
+
+    n_raters = len(ratings)
+    n_units = len(ratings[0])
+
+    # Collect coincidence matrix
+    # Only consider pairs where both raters rated the same unit
+    values: List[float] = []
+    for unit in range(n_units):
+        for rater in range(n_raters):
+            v = ratings[rater][unit]
+            if v is not None:
+                values.append(v)
+
+    if len(values) < 2:
+        return float("nan")
+
+    unique_vals = sorted(set(values))
+    n_vals = len(unique_vals)
+    val_idx = {v: i for i, v in enumerate(unique_vals)}
+
+    if n_vals == 1:
+        return 1.0  # Perfect agreement (trivially)
+
+    # Compute coincidence matrix o[g][k]
+    o = np.zeros((n_vals, n_vals), dtype=float)
+    n_pairable = 0
+
+    for unit in range(n_units):
+        unit_ratings = [
+            ratings[r][unit]
+            for r in range(n_raters)
+            if ratings[r][unit] is not None
+        ]
+        m_u = len(unit_ratings)
+        if m_u < 2:
+            continue
+        n_pairable += m_u * (m_u - 1)
+        for r1 in range(m_u):
+            for r2 in range(m_u):
+                if r1 != r2:
+                    g = val_idx[unit_ratings[r1]]
+                    k = val_idx[unit_ratings[r2]]
+                    o[g][k] += 1.0 / (m_u - 1)
+
+    if n_pairable == 0:
+        return float("nan")
+
+    # Distance function
+    def _distance(g: int, k: int) -> float:
+        vg = unique_vals[g]
+        vk = unique_vals[k]
+        if level_of_measurement == "interval":
+            return (vg - vk) ** 2
+        elif level_of_measurement == "ordinal":
+            # Ordinal: sum frequencies between g and k
+            n_g = sum(o[g, :]) + sum(o[:, g])
+            n_k = sum(o[k, :]) + sum(o[:, k])
+            between = sum(
+                (sum(o[c, :]) + sum(o[:, c]))
+                for c in range(min(g, k), max(g, k) + 1)
+            )
+            return (between - (n_g + n_k) / 2) ** 2
+        else:
+            return float(g != k)  # nominal
+
+    # Observed disagreement D_o
+    n = float(sum(sum(o[g, :]) for g in range(n_vals)))
+    D_o = 0.0
+    for g in range(n_vals):
+        for k in range(n_vals):
+            D_o += o[g][k] * _distance(g, k)
+    if n > 0:
+        D_o /= n
+
+    # Expected disagreement D_e (marginal distribution)
+    n_g_total = np.array([sum(o[g, :]) for g in range(n_vals)])
+    n_total = float(np.sum(n_g_total))
+    D_e = 0.0
+    for g in range(n_vals):
+        for k in range(n_vals):
+            D_e += n_g_total[g] * n_g_total[k] * _distance(g, k)
+    if n_total > 1:
+        D_e /= n_total * (n_total - 1)
+
+    if D_e == 0:
+        return 1.0 if D_o == 0 else 0.0
+
+    alpha = 1.0 - D_o / D_e
+    return round(float(alpha), 4)
+
+
+def compute_krippendorff_per_criterion(
+    judgments_by_judge: Dict[str, Dict[str, float]],
+) -> Dict[str, float]:
+    """Compute Krippendorff's alpha for each criterion across all judges.
+
+    Args:
+        judgments_by_judge: {judge_model: {unit_key: score}}.
+            unit_key = f"{run_id}__{dataset}__{criterion}"
+
+    Returns:
+        {criterion_name: alpha}.
+    """
+    # Collect all unit keys and judges
+    all_units: List[str] = sorted(
+        {
+            "__".join(k.split("__")[:-1])  # strip criterion suffix
+            for v in judgments_by_judge.values()
+            for k in v
+        }
+    )
+
+    # Get criterion names from keys
+    all_criteria: List[str] = sorted(
+        {k.split("__")[-1] for v in judgments_by_judge.values() for k in v}
+    )
+
+    judges = list(judgments_by_judge.keys())
+    results: Dict[str, float] = {}
+
+    for criterion in all_criteria:
+        # Build ratings matrix: rows=judges, cols=units
+        ratings: List[List[Optional[float]]] = []
+        for judge in judges:
+            row: List[Optional[float]] = []
+            for unit in all_units:
+                key = f"{unit}__{criterion}"
+                row.append(judgments_by_judge[judge].get(key))
+            ratings.append(row)
+
+        results[criterion] = krippendorff_alpha(ratings)
+
+    return results
+
+
+def _spearman_rho(xs: List[float], ys: List[float]) -> Optional[float]:
+    """Spearman rank correlation with average-tie handling."""
+    n = len(xs)
+    if n < 3:
+        return None
+
+    def _rank(vals: List[float]) -> List[float]:
+        sorted_idx = sorted(range(n), key=lambda i: vals[i])
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j < n - 1 and vals[sorted_idx[j + 1]] == vals[sorted_idx[j]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                ranks[sorted_idx[k]] = avg
+            i = j + 1
+        return ranks
+
+    rx, ry = _rank(xs), _rank(ys)
+    mx = sum(rx) / n
+    my = sum(ry) / n
+    num = sum((rx[i] - mx) * (ry[i] - my) for i in range(n))
+    dx = sum((rx[i] - mx) ** 2 for i in range(n)) ** 0.5
+    dy = sum((ry[i] - my) ** 2 for i in range(n)) ** 0.5
+    if dx == 0 or dy == 0:
+        return None
+    return round(num / (dx * dy), 4)
+
+
+def compute_spearman_per_criterion(
+    judgments_by_judge: Dict[str, Dict[str, float]],
+) -> Dict[str, float]:
+    """Compute mean pairwise Spearman ρ per criterion across all judges.
+
+    Unlike Krippendorff's α, Spearman ρ measures rank agreement and is
+    insensitive to systematic calibration offsets between judges.
+
+    Args:
+        judgments_by_judge: {judge_model: {unit_key: score}}.
+            unit_key = f"{run_id}__{dataset}__{criterion}"
+
+    Returns:
+        {criterion_name: mean_spearman_rho}
+    """
+    from itertools import combinations
+
+    all_units: List[str] = sorted(
+        {
+            "__".join(k.split("__")[:-1])
+            for v in judgments_by_judge.values()
+            for k in v
+        }
+    )
+    all_criteria: List[str] = sorted(
+        {k.split("__")[-1] for v in judgments_by_judge.values() for k in v}
+    )
+    judges = list(judgments_by_judge.keys())
+    results: Dict[str, float] = {}
+
+    for criterion in all_criteria:
+        pairwise_rhos: List[float] = []
+        for j1, j2 in combinations(judges, 2):
+            paired = [
+                (
+                    judgments_by_judge[j1][f"{u}__{criterion}"],
+                    judgments_by_judge[j2][f"{u}__{criterion}"],
+                )
+                for u in all_units
+                if f"{u}__{criterion}" in judgments_by_judge[j1]
+                and f"{u}__{criterion}" in judgments_by_judge[j2]
+            ]
+            if len(paired) < 3:
+                continue
+            rho = _spearman_rho([p[0] for p in paired], [p[1] for p in paired])
+            if rho is not None:
+                pairwise_rhos.append(rho)
+        if pairwise_rhos:
+            results[criterion] = round(
+                sum(pairwise_rhos) / len(pairwise_rhos), 4
+            )
+
+    return results
 
 
 def holm_bonferroni(

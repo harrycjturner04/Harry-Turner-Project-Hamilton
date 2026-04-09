@@ -1,11 +1,13 @@
 """Evaluation configuration and OpenRouter client setup."""
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import yaml
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,23 @@ def load_config(config_path: Union[str, Path]) -> EvalConfig:
             f"Evaluation config not found: {path}\n"
             f"Copy evaluation_config.example.yaml and fill in your API key."
         )
+    # Load .env from project root (two levels up from this file, or cwd)
+    load_dotenv()
+
     raw = yaml.safe_load(path.read_text("utf-8"))
+
+    # Resolve API key: env vars take priority, then YAML value as fallback
+    api_key = (
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("CRITIC_OPENROUTER_API_KEY")
+        or raw.get("openrouter_api_key")
+        or ""
+    )
+    if not api_key:
+        raise ValueError(
+            "OpenRouter API key not found. Set OPENROUTER_API_KEY in your "
+            ".env file or environment, or set openrouter_api_key in the YAML config."
+        )
 
     models = []
     for m in raw.get("judge_models", []):
@@ -68,7 +86,7 @@ def load_config(config_path: Union[str, Path]) -> EvalConfig:
         ))
 
     return EvalConfig(
-        openrouter_api_key=raw["openrouter_api_key"],
+        openrouter_api_key=api_key,
         openrouter_base_url=raw.get(
             "openrouter_base_url", "https://openrouter.ai/api/v1"
         ),

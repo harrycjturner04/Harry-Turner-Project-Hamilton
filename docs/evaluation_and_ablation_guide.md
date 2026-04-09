@@ -54,6 +54,9 @@ pipeline:
     expert_library: "extended"
     critic_analytical_depth: true
     targeted_refinement: true
+    critic_report: true
+    numerical_accuracy_check: true
+    min_quantitative_grounding: 0.70
 ```
 
 **Test a single feature** (e.g., just enhanced prompts):
@@ -77,6 +80,7 @@ pipeline:
 | `v2_prompts` | Enhanced prompts only | `prompt_version: "v2"` |
 | `crossval` | Genuine cross-validation | `recompute_cross_val: true` |
 | `depth_critic` | Analytical depth critic (WP-C3a) | `critic_analytical_depth: true` |
+| `report_quality` | Report pipeline quality gate (WP-R) | `critic_report: true`, `numerical_accuracy_check: true`, `min_quantitative_grounding: 0.70` |
 | `all_WPs` | Everything enabled | All toggles set to enhanced values |
 
 ### Comparing Runs
@@ -131,6 +135,8 @@ The ablation framework is designed to work with external LLM-as-Judge evaluation
 | Figure Quality | Are plots scientifically appropriate (chart type, annotations)? | `visual_review_mode` |
 | Agent Selection | Are the right experts activated for the data? | `expert_library` |
 | Analytical Depth | Does the critic catch shallow analysis? | `critic_analytical_depth` |
+| Report Narrative Quality | Is the report well-structured with grounded claims? | `critic_report`, `min_quantitative_grounding` |
+| Numerical Accuracy | Do numbers in the report match the analysis artifacts? | `numerical_accuracy_check` |
 
 **Where to find scoring inputs:**
 - `manifest_batch_*.json` -> `run_config`, `files[].stages_completed`, `files[].verified_claims_count`
@@ -205,18 +211,34 @@ Outputs/                    --->  Scripts/evaluation/
 
 ### Running Evaluations
 
+The recommended approach is to pass **explicit directories** rather than `--glob` when you only want to evaluate a subset of configurations. This prevents accidentally including incomplete or in-progress runs, and avoids mixing WP configurations you are not yet ready to compare.
+
 ```bash
-# Evaluate all runs
-python -m Scripts.evaluation evaluate --glob "Outputs/slurm_*"
-
-# Full pipeline (evaluate + pairwise + ablation + export)
-python -m Scripts.evaluation full \
-    --glob "Outputs/slurm_*" \
-    --baseline "baseline-v2"
-
-# Skip already-evaluated runs
+# Evaluate specific runs only (recommended when comparing two configs)
 python -m Scripts.evaluation evaluate \
-    --glob "Outputs/slurm_*" --skip-existing
+    Outputs/slurm_16652393_20260404_123425 \
+    Outputs/slurm_16652395_20260404_202806 \
+    Outputs/slurm_16652396_20260405_012759 \
+    Outputs/slurm_16654063_20260405_161550 \
+    Outputs/slurm_16654064_20260405_205312 \
+    Outputs/slurm_16654065_20260406_002128 \
+    --skip-existing
+
+# Full pipeline using explicit directories
+python -m Scripts.evaluation full \
+    Outputs/slurm_A Outputs/slurm_B Outputs/slurm_C \
+    --baseline "Baseline" --skip-existing
+
+# Alternatively, evaluate all discovered runs
+python -m Scripts.evaluation evaluate --glob "Outputs/slurm_*" --skip-existing
+```
+
+> **Important:** Do **not** use `full` again on runs already evaluated — the pairwise step does not deduplicate and will corrupt BT/Elo rankings. Use `ablation` alone to regenerate the report from existing data after code changes.
+
+```bash
+# Regenerate report and figures only (no new LLM calls)
+python -m Scripts.evaluation ablation \
+    Outputs/slurm_A Outputs/slurm_B ... --baseline "Baseline"
 ```
 
 ### Replicated Runs
@@ -264,7 +286,7 @@ Each criterion has **5 anchor points** (0, 3, 5, 7, 10) with concrete descriptio
 ### Pairwise Comparison
 
 ```bash
-python -m Scripts.evaluation pairwise --glob "Outputs/slurm_*"
+python -m Scripts.evaluation pairwise Outputs/slurm_A Outputs/slurm_B ...
 ```
 
 For each pair, the judge receives both reports and answers: *"Which analysis is stronger and why?"*
@@ -272,8 +294,12 @@ For each pair, the judge receives both reports and answers: *"Which analysis is 
 **Position-bias mitigation:** Report order is randomised. With multiple judge models, each pair receives 4+ independent evaluations.
 
 **Ranking methods:**
-- **Bradley-Terry MLE** -- log-linear strength model
-- **Elo ratings** -- simpler alternative (K=32)
+- **Bradley-Terry MLE** — log-linear strength model; returns log-scale strength scores (mean-normalised to 0)
+- **Elo ratings** — simpler sequential alternative (K=32, initial rating=1000)
+
+Both methods produce **run-level** scores internally, then the `ablation` command **aggregates them to config-level** by averaging across replications per `run_label`. This means the ablation report shows meaningful config comparisons rather than individual run IDs.
+
+> **Interpretation note:** A single exceptional run in one configuration can dominate the run-level rankings even if the config's mean score is lower. Config-level aggregation and the LLM judge mean score together give a more complete picture — use both.
 
 ```bash
 python -m Scripts.evaluation rankings
@@ -285,42 +311,80 @@ For replicated runs (N >= 2 per configuration):
 
 | Method | Purpose |
 |--------|---------|
-| **Bootstrap CI** | 95% confidence intervals (10K resamples) |
+| **Bootstrap CI** | 95% confidence intervals (10K resamples, percentile method) |
 | **Mann-Whitney U** | Non-parametric significance test (appropriate for small N) |
 | **Permutation test** | Two-sided, 10K permutations |
-| **Cohen's d** | Effect size with Hedges' g correction for small samples |
+| **Cohen's d** | Effect size with Hedges' g correction for small samples; **95% bootstrap CIs reported in the forest plot** |
 | **Holm-Bonferroni** | Multiple comparison correction across all pairs |
+| **Coefficient of Variation (CoV)** | Repeatability: std/mean across replications (<0.15 stable, >0.25 high variance) |
+| **Krippendorff's α** | Inter-judge agreement per criterion (≥0.8 good, 0.6–0.8 acceptable, <0.6 unreliable) |
+| **Pearson r (cross-dataset)** | Correlation of per-dataset mean scores across configs; requires ≥3 shared datasets |
 
-Effect size interpretation: |d| < 0.2 negligible, 0.2-0.5 small, 0.5-0.8 medium, > 0.8 large.
+Effect size interpretation: |d| < 0.2 negligible, 0.2–0.5 small, 0.5–0.8 medium, >0.8 large.
+
+**Inter-judge agreement (Krippendorff's α):** Negative α values indicate judges disagree more than chance — typically caused by calibration differences (systematic scoring offsets) or genuinely different internal rubrics. For ablation purposes, check that both judges agree on the **direction** of the config comparison even if absolute scores differ. Two weak judges with poor agreement is worse than one strong judge — if α is consistently below 0.4, consider replacing both models with a single stronger judge (GPT-4o, Claude Sonnet/Opus).
+
+### Gate Quality vs Cross-Validation Quality
+
+The evaluation framework distinguishes between two types of pipeline-internal quality signals:
+
+**Gate quality scores** (from `debug/*__gate.json`) apply only to **cleaning and analysis** stages. These stages use a gated retry loop — the critic evaluates output quality, assigns a `quality_score` (0–1), and triggers retries until the score threshold is met or retries are exhausted. The gate quality table in the ablation report shows mean ± std across replications for these two stages only.
+
+**Cross-validation** does not use a retry/gate loop. It calls the LLM once, then optionally applies a deterministic fallback to verify claims from the data files directly. Its quality is instead measured by two structural metrics (Section 4b of the ablation report):
+- `verified_claims_count` — number of analysis claims independently recomputed from the parquet (higher = better)
+- `cv_gaps_count` — number of gaps or inconsistencies identified (lower = better)
+
+These structural metrics are zero-cost (no LLM calls) and are reported separately.
 
 ### Outputs and Exports
 
 ```bash
 # Ablation analysis (requires baseline label)
 python -m Scripts.evaluation ablation \
-    --baseline "baseline-v2" --glob "Outputs/slurm_*"
+    Outputs/slurm_A Outputs/slurm_B ... --baseline "Baseline"
 ```
 
-| Output | Location | Description |
-|--------|----------|-------------|
-| SQLite database | `Evaluation/evaluation.db` | All scores, judgments, comparisons, rankings |
-| Ablation report | `Evaluation/reports/ablation_report.md` | Markdown summary with tables and figure references |
-| Radar chart | `Evaluation/figures/radar_chart.png` | Rubric criterion scores per configuration |
-| Score heatmap | `Evaluation/figures/score_heatmap.png` | Configuration x Criterion matrix |
-| Bar chart | `Evaluation/figures/overall_bar_chart.png` | Mean +/- 95% CI per configuration |
-| Violin plots | `Evaluation/figures/overall_distributions.png` | Score distributions (essential for N=5-10) |
-| Forest plot | `Evaluation/figures/effect_size_forest.png` | Effect sizes with significance |
-| Win matrix | `Evaluation/figures/pairwise_win_matrix.png` | NxN pairwise win rates |
-| LaTeX results table | `Evaluation/exports/results_table.tex` | Mean +/- std, booktabs format |
-| LaTeX significance table | `Evaluation/exports/significance_table.tex` | p-values with stars, effect sizes |
-| Raw judgments | `Evaluation/raw_judgments/*.json` | Full judge responses for provenance |
+**Ablation report sections (`Evaluation/ablation_report.md`):**
 
-**Export formats:**
+| Section | Content |
+|---------|---------|
+| 1. Overview | LLM judge mean ± std per config per criterion |
+| 2. Statistical Comparisons | Mean diff, Cohen's d with 95% CI, Mann-Whitney p, Holm-Bonferroni correction |
+| 3. Rankings (Config-Level) | Bradley-Terry and Elo scores aggregated per config (averaged across replications) |
+| 4. Gate Quality (Cleaning & Analysis) | Mean ± std pipeline gate scores (0–1); cleaning and analysis only |
+| 4b. Cross-Validation Quality | verified_claims_count and cv_gaps_count per config |
+| 5. Per-Dataset Breakdown | Overall judge score per config per dataset |
+| 6. Per-Judge Breakdown | Overall score per config per judge model; reveals calibration offsets |
+| 7. Inter-Judge Agreement | Krippendorff's α per criterion |
+| 8. Repeatability (CoV) | Coefficient of variation per metric per config |
+| 9. Cross-Dataset Correlation | Pearson r of per-dataset scores across configs (requires ≥3 datasets) |
+
+**Figures (`Evaluation/figures/`):**
+
+| Figure | Description |
+|--------|-------------|
+| `radar_chart.png` | Rubric criterion scores per configuration |
+| `score_heatmap.png` | Configuration × Criterion matrix |
+| `overall_bar_chart.png` | Mean + 95% CI; y-axis floored near data range to show differences |
+| `overall_distributions.png` | Strip plot with mean line (N<5); violin suppressed below N=5 |
+| `effect_size_forest.png` | Cohen's d point estimates with 95% bootstrap CIs; threshold guidelines on secondary x-axis |
+| `rankings.png` | Config-level BT and Elo in **separate subplots** (different scales — sharing an axis hides BT values) |
+| `stage_quality_progression.png` | Gate quality per stage; only stages with data are plotted (cross-validation excluded) |
+| `repeatability_violin.png` | Score spread per config; violin suppressed for N<5, shows points + mean line |
+| `judge_agreement.png` | Krippendorff's α heatmap per criterion |
+
+**Exports (`Evaluation/exports/`):**
+
 ```bash
-python -m Scripts.evaluation export --format latex   # LaTeX tables
+python -m Scripts.evaluation export --format latex   # LaTeX tables (booktabs)
 python -m Scripts.evaluation export --format csv     # CSV
 python -m Scripts.evaluation export --format json    # JSON
 ```
+
+| Export | Description |
+|--------|-------------|
+| `results_table.tex` | Mean ± std per config × metric |
+| `significance_table.tex` | Cohen's d, p-values with *** stars, Holm-Bonferroni correction |
 
 ### CLI Reference
 
@@ -358,7 +422,7 @@ bash Scripts/evaluation/launch_replicates.sh --replicates 5
 
 # 4. Run full evaluation
 python -m Scripts.evaluation full \
-    --glob "Outputs/slurm_*" --baseline "baseline"
+    --glob "Outputs/slurm_*" --baseline "Baseline"
 
 # 5. Results in Evaluation/ -- figures, LaTeX tables, SQLite DB
 ```
@@ -367,4 +431,16 @@ python -m Scripts.evaluation full \
 
 ## Feature Toggle Reference
 
-See the main [README](../README.md) for the complete list of all feature toggles including the WP-C critic architecture toggles (`critic_analytical_depth`, `critic_execution`, `targeted_refinement`, `refinement_cascade`).
+See the main [README](../README.md) for the complete list of all feature toggles including the WP-C critic architecture toggles (`critic_analytical_depth`, `critic_execution`, `targeted_refinement`, `refinement_cascade`) and the WP-R report quality controls (`critic_report`, `min_quantitative_grounding`, `numerical_accuracy_check`).
+
+### WP-R: Report Quality Controls
+
+These toggles control quality gates applied to the **report pipeline** output (Phase 3d in `report_pipeline.py`), not the captain pipeline fallback report. The quality gate logic lives in `report_quality.py` and orchestrates up to 2 revision rounds when checks are enabled.
+
+| Toggle | Type | Default | Description |
+|--------|------|---------|-------------|
+| `critic_report` | bool | `true` | LLM narrative critic on report pipeline output. Uses a 6-criteria rubric (executive summary quality, numerical fidelity, conclusion support, data faithfulness, section completeness, synthesis vs enumeration) via the OpenRouter critic client (`CRITIC_OPENROUTER_API_KEY`). |
+| `min_quantitative_grounding` | float | `0.0` | Minimum fraction of analytical paragraphs that must contain at least one number. If the report falls below this threshold, a revision round adds quantitative detail. Set to 0.0 to disable; recommended starting value is 0.70. |
+| `numerical_accuracy_check` | bool | `true` | Pure-Python heuristic that flags numbers in report prose contradicting analysis or cleaning JSON artifacts. Produces MUST_FIX/SHOULD_FIX issues that feed into the revision round. |
+
+When `critic_report` and `numerical_accuracy_check` are set to `false`, the quality gate is a no-op — the report passes through unchanged, preserving ablation baseline behaviour. Reports generated from degraded analyses automatically receive a quality caveat section. The captain pipeline's fallback report stage has no quality gates applied; it produces a basic LLM-generated narrative only.

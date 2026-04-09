@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -44,7 +44,29 @@ CREATE TABLE IF NOT EXISTS structural_metrics (
     stages_analysis INTEGER,
     stages_cross_validation INTEGER,
     stages_report INTEGER,
+    data_coverage_rate REAL,
+    figure_reference_rate REAL,
+    quantitative_grounding_rate REAL,
     UNIQUE(run_id, dataset_name)
+);
+
+CREATE TABLE IF NOT EXISTS stage_gate_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    dataset_name TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    attempt_label TEXT NOT NULL DEFAULT '',
+    quality_score REAL,
+    quality_structural REAL,
+    quality_content REAL,
+    quality_visual REAL,
+    status TEXT,
+    check_pass_rate_must_fix REAL,
+    check_pass_rate_should_fix REAL,
+    total_checks INTEGER,
+    num_retries INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, dataset_name, stage, attempt_label)
 );
 
 CREATE TABLE IF NOT EXISTS judgments (
@@ -157,7 +179,6 @@ class EvalDB:
     def _init_schema(self) -> None:
         cur = self.conn.cursor()
         cur.executescript(_SCHEMA_SQL)
-        # Check / set schema version
         rows = cur.execute(
             "SELECT version FROM schema_version"
         ).fetchall()
@@ -166,7 +187,36 @@ class EvalDB:
                 "INSERT INTO schema_version(version) VALUES(?)",
                 (SCHEMA_VERSION,),
             )
+        else:
+            stored = rows[0][0]
+            if stored < SCHEMA_VERSION:
+                self._migrate(stored)
+                cur.execute(
+                    "UPDATE schema_version SET version=?",
+                    (SCHEMA_VERSION,),
+                )
         self.conn.commit()
+
+    def _migrate(self, from_version: int) -> None:
+        """Apply schema migrations from from_version up to SCHEMA_VERSION."""
+        if from_version < 2:
+            # Add new columns to structural_metrics for existing databases
+            new_cols = [
+                ("data_coverage_rate", "REAL"),
+                ("figure_reference_rate", "REAL"),
+                ("quantitative_grounding_rate", "REAL"),
+            ]
+            existing = {
+                row[1] for row in self.conn.execute(
+                    "PRAGMA table_info(structural_metrics)"
+                ).fetchall()
+            }
+            for col, col_type in new_cols:
+                if col not in existing:
+                    self.conn.execute(
+                        f"ALTER TABLE structural_metrics ADD COLUMN {col} {col_type}"
+                    )
+            logger.info("Applied schema migration v1 -> v2")
 
     def close(self) -> None:
         self.conn.close()
@@ -237,17 +287,25 @@ class EvalDB:
         verified_claims_count: int,
         cv_gaps_count: int,
         stages: Dict[str, bool],
+        data_coverage_rate: Optional[float] = None,
+        figure_reference_rate: Optional[float] = None,
+        quantitative_grounding_rate: Optional[float] = None,
     ) -> None:
         self.conn.execute(
             """INSERT INTO structural_metrics (
                 run_id, dataset_name, plot_count, verified_claims_count,
                 cv_gaps_count, stages_cleaning, stages_analysis,
-                stages_cross_validation, stages_report
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stages_cross_validation, stages_report,
+                data_coverage_rate, figure_reference_rate,
+                quantitative_grounding_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, dataset_name) DO UPDATE SET
                 plot_count=excluded.plot_count,
                 verified_claims_count=excluded.verified_claims_count,
-                cv_gaps_count=excluded.cv_gaps_count
+                cv_gaps_count=excluded.cv_gaps_count,
+                data_coverage_rate=excluded.data_coverage_rate,
+                figure_reference_rate=excluded.figure_reference_rate,
+                quantitative_grounding_rate=excluded.quantitative_grounding_rate
             """,
             (
                 run_id, dataset_name, plot_count, verified_claims_count,
@@ -256,9 +314,110 @@ class EvalDB:
                 1 if stages.get("analysis") else 0,
                 1 if stages.get("cross_validation") else 0,
                 1 if stages.get("report") else 0,
+                data_coverage_rate,
+                figure_reference_rate,
+                quantitative_grounding_rate,
             ),
         )
         self.conn.commit()
+
+    def get_structural_metrics(
+        self,
+        run_id: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM structural_metrics WHERE 1=1"
+        params: List[Any] = []
+        if run_id:
+            query += " AND run_id=?"
+            params.append(run_id)
+        if dataset_name:
+            query += " AND dataset_name=?"
+            params.append(dataset_name)
+        return [dict(r) for r in self.conn.execute(query, params).fetchall()]
+
+    # ── Stage gate metrics ───────────────────────────────────────────
+
+    def upsert_stage_gate_metric(
+        self,
+        run_id: str,
+        dataset_name: str,
+        stage: str,
+        attempt_label: str,
+        quality_score: Optional[float],
+        status: Optional[str],
+        quality_breakdown: Optional[Dict[str, float]] = None,
+        check_pass_rate_must_fix: Optional[float] = None,
+        check_pass_rate_should_fix: Optional[float] = None,
+        total_checks: Optional[int] = None,
+        num_retries: Optional[int] = None,
+    ) -> None:
+        qb = quality_breakdown or {}
+        self.conn.execute(
+            """INSERT INTO stage_gate_metrics (
+                run_id, dataset_name, stage, attempt_label,
+                quality_score, quality_structural, quality_content,
+                quality_visual, status,
+                check_pass_rate_must_fix, check_pass_rate_should_fix,
+                total_checks, num_retries, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, dataset_name, stage, attempt_label)
+            DO UPDATE SET
+                quality_score=excluded.quality_score,
+                quality_structural=excluded.quality_structural,
+                quality_content=excluded.quality_content,
+                quality_visual=excluded.quality_visual,
+                status=excluded.status,
+                check_pass_rate_must_fix=excluded.check_pass_rate_must_fix,
+                check_pass_rate_should_fix=excluded.check_pass_rate_should_fix,
+                total_checks=excluded.total_checks,
+                num_retries=excluded.num_retries,
+                created_at=excluded.created_at
+            """,
+            (
+                run_id, dataset_name, stage, attempt_label,
+                quality_score,
+                qb.get("structural"),
+                qb.get("content"),
+                qb.get("visual"),
+                status,
+                check_pass_rate_must_fix,
+                check_pass_rate_should_fix,
+                total_checks,
+                num_retries,
+                _now_iso(),
+            ),
+        )
+        self.conn.commit()
+
+    def get_stage_gate_metrics(
+        self,
+        run_id: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        stage: Optional[str] = None,
+        final_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve stage gate metrics.
+
+        Args:
+            final_only: If True, only return records with attempt_label=''.
+                        These are the initial/final gate results per stage.
+        """
+        query = "SELECT * FROM stage_gate_metrics WHERE 1=1"
+        params: List[Any] = []
+        if run_id:
+            query += " AND run_id=?"
+            params.append(run_id)
+        if dataset_name:
+            query += " AND dataset_name=?"
+            params.append(dataset_name)
+        if stage:
+            query += " AND stage=?"
+            params.append(stage)
+        if final_only:
+            query += " AND attempt_label=''"
+        query += " ORDER BY run_id, dataset_name, stage, attempt_label"
+        return [dict(r) for r in self.conn.execute(query, params).fetchall()]
 
     # ── Judgments ─────────────────────────────────────────────────────
 

@@ -272,3 +272,108 @@ def compute_elo_ratings(
 def response_hash(raw_response: str) -> str:
     """SHA-256 hash for provenance."""
     return hashlib.sha256(raw_response.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class PairwiseResultWithConsistency:
+    """Pairwise comparison result enriched with position-swap consistency."""
+
+    primary: PairwiseResult
+    swapped: Optional[PairwiseResult]
+    consistent: bool         # True if both orderings agree on winner
+    winner: str              # Consensus winner; 'tie' if inconsistent
+    inconsistency_note: str  # Empty string if consistent
+
+
+def pairwise_compare_with_swap(
+    run_a_id: str,
+    run_b_id: str,
+    report_a: str,
+    report_b: str,
+    dataset_name: str,
+    judge_model: "JudgeModelSpec",
+    client: Any,
+    max_chars: int = 15_000,
+) -> PairwiseResultWithConsistency:
+    """Compare two reports with position-swap consistency check.
+
+    Runs the comparison twice: once with A first, once with B first.
+    Only accepts the verdict if both orderings agree on the winner,
+    mitigating position bias (documented at 60-75% without this check).
+
+    Args:
+        Same as pairwise_compare(), but randomize_order is controlled
+        internally to ensure exactly one A-first and one B-first run.
+
+    Returns:
+        PairwiseResultWithConsistency with consistent=True only when
+        both orderings produce the same winner.
+    """
+    # First pass: A presented first
+    primary = pairwise_compare(
+        run_a_id=run_a_id,
+        run_b_id=run_b_id,
+        report_a=report_a,
+        report_b=report_b,
+        dataset_name=dataset_name,
+        judge_model=judge_model,
+        client=client,
+        max_chars=max_chars,
+        randomize_order=False,  # force A first
+    )
+
+    try:
+        # Second pass: swap A and B positions
+        swapped_raw = pairwise_compare(
+            run_a_id=run_b_id,  # swap IDs
+            run_b_id=run_a_id,
+            report_a=report_b,  # swap reports
+            report_b=report_a,
+            dataset_name=dataset_name,
+            judge_model=judge_model,
+            client=client,
+            max_chars=max_chars,
+            randomize_order=False,  # force swapped-A (original B) first
+        )
+    except Exception as exc:
+        logger.warning(
+            "Position-swap comparison failed for %s/%s: %s",
+            run_a_id, run_b_id, exc,
+        )
+        return PairwiseResultWithConsistency(
+            primary=primary,
+            swapped=None,
+            consistent=False,
+            winner="tie",
+            inconsistency_note=f"Swap call failed: {exc}",
+        )
+
+    # Map swapped result back to original ID space
+    # swapped.winner is in terms of run_b_id/run_a_id (swapped roles)
+    if swapped_raw.winner == run_b_id:
+        # Swapped comparison had "run_b_id" in position A, and it won
+        # → original run_a_id would be the winner in standard framing
+        swapped_winner_in_original = run_a_id
+    elif swapped_raw.winner == run_a_id:
+        swapped_winner_in_original = run_b_id
+    else:
+        swapped_winner_in_original = "tie"
+
+    consistent = primary.winner == swapped_winner_in_original
+    consensus_winner = primary.winner if consistent else "tie"
+    note = (
+        ""
+        if consistent
+        else (
+            f"Inconsistent: A-first={primary.winner}, "
+            f"B-first={swapped_winner_in_original}"
+        )
+    )
+
+    return PairwiseResultWithConsistency(
+        primary=primary,
+        swapped=swapped_raw,
+        consistent=consistent,
+        winner=consensus_winner,
+        inconsistency_note=note,
+    )

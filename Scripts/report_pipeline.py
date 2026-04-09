@@ -20,6 +20,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -91,11 +92,21 @@ def _build_research_message(
 def _extract_manifest_data(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Parse manifest items into a structured list for the report agents."""
     items = manifest.get("items", [])
+
+    # Build per-file degraded status lookup from quality_review
+    _qr = manifest.get("quality_review", {})
+    _file_statuses = {
+        fs.get("file", ""): fs.get("degraded", False)
+        for fs in _qr.get("file_statuses", [])
+    }
+
     parsed = []
     for item in items:
+        _file = item.get("file", "unknown")
         entry: Dict[str, Any] = {
-            "file": item.get("file", "unknown"),
-            "file_name": Path(item.get("file", "unknown")).stem,
+            "file": _file,
+            "file_name": Path(_file).stem,
+            "analysis_degraded": _file_statuses.get(_file, False),
         }
 
         # Cleaning data
@@ -410,7 +421,9 @@ def _query_knowledge(
             ],
             temperature=0.1,
         )
-        return autogen.OpenAIWrapper.extract_text_or_completion_object(response)[0]
+        # Use instance method — class method API changed in newer autogen
+        result = client.extract_text_or_completion_object(response)[0]
+        return result if isinstance(result, str) else (getattr(result, "content", None) or "")
     except Exception as exc:
         logger.warning("Knowledge base query failed: %s", exc)
         return ""
@@ -535,6 +548,27 @@ def _create_groupchat_agents(
                     "InterpretationAgent",
                     vis_turns,
                 )
+                # WP-R P1-5: If no figures were generated, warn InterpretationAgent
+                if not _figure_manifest_injected:
+                    _has_any_figs = any(
+                        any(d.rglob("*.png")) for d in _scan_dirs if d and d.exists()
+                    )
+                    if not _has_any_figs:
+                        groupchat.messages.append({
+                            "role": "assistant",
+                            "name": "FigureManifest",
+                            "content": (
+                                "## No Figures Generated\n\n"
+                                "The VisualisationAgent did not produce any figures. "
+                                "Do NOT reference any Figure numbers in the report. "
+                                "Write the report using only the analysis summary data "
+                                "and existing analysis plots listed in the payload."
+                            ),
+                        })
+                        logger.warning(
+                            "VisualisationAgent produced 0 figures after %d turns",
+                            vis_turns,
+                        )
                 return interp_agent
             # Otherwise return to the agent that requested execution
             for msg in reversed(groupchat.messages):
@@ -690,6 +724,31 @@ def _embed_inline_figures(
         Path(fp).name.lower(): fp for fp in all_figures
     }
 
+    # Build stem-word sets for semantic matching (Strategy 3)
+    _stem_words: Dict[str, set] = {}
+    for fp in all_figures:
+        stem = Path(fp).stem.lower()
+        words = set(re.split(r'[_\-\s]+', stem)) - {"fig", "figure", "png"}
+        # Remove pure numeric tokens
+        words = {w for w in words if not w.isdigit()}
+        _stem_words[fp] = words
+
+    def _semantic_match(context_text: str, candidates: List[str]) -> Optional[str]:
+        """Find the figure whose filename stem best matches the context text."""
+        ctx_lower = context_text.lower()
+        ctx_words = set(re.split(r'[_\-\s,;:.()]+', ctx_lower)) - {"", "figure", "fig", "the", "a", "of", "and", "in", "for", "by", "with", "to", "is"}
+        best_path = None
+        best_score = 0
+        for fp in candidates:
+            words = _stem_words.get(fp, set())
+            if not words:
+                continue
+            overlap = len(words & ctx_words)
+            if overlap > best_score:
+                best_score = overlap
+                best_path = fp
+        return best_path if best_score >= 2 else None
+
     # ── Walk lines and embed after paragraphs ──
     embedded: set = set()
     lines = report_md.split("\n")
@@ -722,9 +781,20 @@ def _embed_inline_figures(
                         if candidate in path_by_name:
                             fig_path = path_by_name[candidate]
 
-                    # Strategy 2: filename-prefix mapping
+                    # Strategy 2: filename-prefix mapping (fig1_* → Figure 1)
                     if fig_path is None and fig_num in fig_map:
                         fig_path = fig_map[fig_num]
+
+                    # Strategy 3: semantic keyword matching between context
+                    # and filename stems (prevents caption–image mismatches)
+                    if fig_path is None:
+                        # Gather context: current line + next 2 lines
+                        context_window = line
+                        for offset in range(1, 3):
+                            if i + offset < len(lines):
+                                context_window += " " + lines[i + offset]
+                        _unembedded = [f for f in all_figures if f not in embedded]
+                        fig_path = _semantic_match(context_window, _unembedded)
 
                     if fig_path and fig_path not in embedded:
                         fig_name = Path(fig_path).stem.replace("_", " ").title()
@@ -739,13 +809,62 @@ def _embed_inline_figures(
     return "\n".join(result_lines), embedded
 
 
+_MAX_IMAGE_BYTES = 20_000_000   # 20 MB hard ceiling per image
+_MAX_IMAGE_PIXELS = 100_000_000  # 100 Mpx hard ceiling per image
+
+
+def _image_within_limits(path: str) -> bool:
+    """Return True if the image file is within size and pixel limits."""
+    p = Path(path)
+    if not p.exists():
+        return False
+    if p.stat().st_size > _MAX_IMAGE_BYTES:
+        logger.warning(
+            "Image rejected (file size %d bytes > %d limit): %s",
+            p.stat().st_size, _MAX_IMAGE_BYTES, p.name,
+        )
+        return False
+    # Quick pixel-count check via PIL header (does not decode full image)
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(p) as img:
+            w, h = img.size
+            if w * h > _MAX_IMAGE_PIXELS:
+                logger.warning(
+                    "Image rejected (pixel count %d > %d limit): %s",
+                    w * h, _MAX_IMAGE_PIXELS, p.name,
+                )
+                return False
+    except Exception:
+        pass  # if PIL unavailable, rely on file-size check only
+    return True
+
+
+def _extract_cited_stems(analysis_summary: Dict) -> "Counter[str]":
+    """Count how many findings cite each figure stem (basename without extension)."""
+    counts: Counter = Counter()
+    for finding in analysis_summary.get("findings", []):
+        ref = None
+        if isinstance(finding, dict):
+            ref = finding.get("figure_ref") or finding.get("figure")
+        elif isinstance(finding, str):
+            pass  # bare string findings carry no figure_ref
+        if ref:
+            counts[Path(str(ref)).stem.lower()] += 1
+    return counts
+
+
 def _select_figures(
     all_figures: List[str],
     figure_selection: str = "all",
     max_figures: int = 10,
     png_min_bytes: int = 5000,
+    cited_stems: Optional["Counter[str]"] = None,
 ) -> List[str]:
     """Apply figure selection strategy (WP6) and return filtered list."""
+    # Hard safety filter: reject oversized images regardless of strategy
+    all_figures = [f for f in all_figures if _image_within_limits(f)]
+
     if figure_selection == "ranked":
         all_figures = [
             f for f in all_figures
@@ -753,9 +872,13 @@ def _select_figures(
         ]
         seen_stems: set = set()
         ranked: List[str] = []
+        _cited = cited_stems or Counter()
         for fig in sorted(
             all_figures,
-            key=lambda p: Path(p).stat().st_size if Path(p).exists() else 0,
+            key=lambda p: (
+                _cited.get(Path(p).stem.lower(), 0),
+                Path(p).stat().st_size if Path(p).exists() else 0,
+            ),
             reverse=True,
         ):
             stem = Path(fig).stem
@@ -852,6 +975,84 @@ def _log_figure_alignment(report_md: str) -> None:
     logger.info("Figure alignment: %d total references in assembled report", len(refs_found))
 
 
+def _validate_assembled_report(report_md: str, label: str = "") -> Dict[str, Any]:
+    """Post-assembly validation: check figure refs, section completeness, and basic quality.
+
+    Returns a dict with validation results and a cleaned report_md with broken
+    figure references removed (to prevent PDF crashes on missing images).
+    """
+    from urllib.parse import unquote
+
+    issues: List[str] = []
+
+    # ── 1. Figure reference validation ──
+    ref_pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+    refs = ref_pattern.findall(report_md)
+    total_refs = len(refs)
+    broken_refs = []
+    for alt_text, path_str in refs:
+        if path_str.startswith(("http://", "https://", "data:")):
+            continue
+        decoded = unquote(path_str)
+        if not Path(decoded).exists():
+            broken_refs.append((alt_text, path_str))
+
+    broken_ratio = len(broken_refs) / total_refs if total_refs > 0 else 0.0
+    if broken_refs:
+        issues.append(
+            f"Figure refs: {len(broken_refs)}/{total_refs} broken "
+            f"({broken_ratio:.0%})"
+        )
+        for alt, path in broken_refs:
+            logger.warning(
+                "[%s] Broken figure ref removed: alt='%s' path='%s'",
+                label, alt[:40], Path(path).name,
+            )
+        # Remove broken refs so they don't crash PDF or confuse readers
+        def _remove_broken(m):
+            p = unquote(m.group(2))
+            if p.startswith(("http://", "https://", "data:")):
+                return m.group(0)
+            if not Path(p).exists():
+                return ""  # remove entirely
+            return m.group(0)
+        report_md = ref_pattern.sub(_remove_broken, report_md)
+        # Clean up empty lines left by removal
+        report_md = re.sub(r'\n{3,}', '\n\n', report_md)
+
+    # ── 2. Section completeness ──
+    _REQUIRED_SECTIONS = [
+        "executive summary", "data", "cleaning", "analysis",
+        "cross-validation", "conclusion", "recommendation",
+    ]
+    found_sections = [
+        h.lower() for h in re.findall(r'^##\s+\d*\.?\s*(.*)', report_md, re.MULTILINE)
+    ]
+    for req in _REQUIRED_SECTIONS:
+        if not any(req in s for s in found_sections):
+            issues.append(f"Missing section: '{req}'")
+
+    # ── 3. Minimum content check ──
+    if len(report_md.strip()) < 500:
+        issues.append(f"Report too short: {len(report_md.strip())} chars")
+
+    if issues:
+        logger.warning(
+            "[%s] Post-assembly validation: %d issue(s): %s",
+            label, len(issues), "; ".join(issues),
+        )
+    else:
+        logger.info("[%s] Post-assembly validation: all checks passed", label)
+
+    return {
+        "issues": issues,
+        "total_figure_refs": total_refs,
+        "broken_figure_refs": len(broken_refs),
+        "broken_ratio": broken_ratio,
+        "report_md": report_md,
+    }
+
+
 def _assemble_report_with_figures(
     report_md: str,
     figure_dir: Path,
@@ -859,6 +1060,7 @@ def _assemble_report_with_figures(
     figure_selection: str = "all",
     max_figures: int = 10,
     png_min_bytes: int = 5000,
+    analysis_summary: Optional[Dict] = None,
 ) -> str:
     """Embed figure references into the report markdown.
 
@@ -872,7 +1074,8 @@ def _assemble_report_with_figures(
 
     figure_selection controls strategy:
       - "all": include all figures (baseline behaviour)
-      - "ranked": rank by file size, deduplicate by stem, cap at max_figures
+      - "ranked": rank by citation frequency (figure_ref in findings) then file
+        size, deduplicate by stem, cap at max_figures
       - "top_n": take first max_figures figures in order
     """
     _fig_count = (
@@ -900,6 +1103,11 @@ def _assemble_report_with_figures(
             seen.add(f)
             deduped.append(f)
     all_figures = deduped
+
+    # Build citation-frequency map from analysis findings for ranked selection
+    _cited_stems: Counter = (
+        _extract_cited_stems(analysis_summary) if analysis_summary else Counter()
+    )
 
     # Build a combined lookup by stem across ALL figures (report + analysis)
     all_by_stem: Dict[str, str] = {}
@@ -973,7 +1181,8 @@ def _assemble_report_with_figures(
                         unreferenced.append(str(p))
 
         unreferenced = _select_figures(
-            unreferenced, figure_selection, max_figures, png_min_bytes
+            unreferenced, figure_selection, max_figures, png_min_bytes,
+            cited_stems=_cited_stems,
         )
         if unreferenced:
             report_md += _build_themed_figure_section(unreferenced)
@@ -982,7 +1191,10 @@ def _assemble_report_with_figures(
         return report_md
 
     # Apply figure selection strategy (WP6)
-    all_figures = _select_figures(all_figures, figure_selection, max_figures, png_min_bytes)
+    all_figures = _select_figures(
+        all_figures, figure_selection, max_figures, png_min_bytes,
+        cited_stems=_cited_stems,
+    )
 
     if not all_figures:
         return report_md
@@ -1083,6 +1295,34 @@ class ReportPipeline:
         self._research_consecutive_failures = 0
         self._research_max_failures = 3  # disable after 3 consecutive failures
         self._research_disabled = False
+
+        # ---- WP-R: OpenRouter critic client for report quality gates ----
+        _or_key = os.environ.get("CRITIC_OPENROUTER_API_KEY", "")
+        if _or_key:
+            try:
+                from openai import OpenAI as _OpenAI
+                self._critic_client = _OpenAI(
+                    api_key=_or_key,
+                    base_url=os.environ.get(
+                        "CRITIC_BASE_URL", "https://openrouter.ai/api/v1",
+                    ),
+                    timeout=60.0,
+                    max_retries=1,
+                )
+                self._critic_model = os.environ.get(
+                    "CRITIC_MODEL", "x-ai/grok-4.1-fast",
+                )
+                logger.info(
+                    "Report pipeline critic client configured: model=%s",
+                    self._critic_model,
+                )
+            except Exception as exc:
+                logger.warning("Failed to initialise critic client: %s", exc)
+                self._critic_client = None
+                self._critic_model = ""
+        else:
+            self._critic_client = None
+            self._critic_model = ""
 
     def _get_research_agent(self):
         if not self._research_agent_initialised:
@@ -1240,6 +1480,65 @@ class ReportPipeline:
                 file_name, len(_exec_figs), _n_copied, REPORT_FIGURES_SUBDIR,
             )
 
+        # ── Phase 3c: Clean up nested dirs in exec_workdir ──
+        # LLM-generated code sometimes treats the absolute figure_dir path
+        # as relative to CWD, creating nested Outputs/ trees.  Now that
+        # figures have been copied back, remove the stale work_dir to
+        # prevent duplication.
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+            logger.debug("[%s] Cleaned up exec work_dir: %s", file_name, work_dir)
+
+        # ── Phase 3d: WP-R quality gate (post-generation, pre-assembly) ──
+        if report_md.strip() and self._run_config is not None:
+            try:
+                from report_quality import run_report_quality_gate
+                # Extract verified claims from cross-validation for WP-R6b
+                _cross_val = item.get("cross_validation", {})
+                _verified_claims = _cross_val.get("verified_claims", [])
+                report_md, _qmeta = run_report_quality_gate(
+                    report_md=report_md,
+                    analysis_summary=item.get("analysis_summary", {}),
+                    cleaning_summary=item.get("cleaning_summary", {}),
+                    run_config=self._run_config,
+                    critic_client=self._critic_client,
+                    critic_model=self._critic_model,
+                    llm_config=self.llm_config,
+                    label=file_name,
+                    verified_claims=_verified_claims,
+                )
+                if _qmeta.get("revisions_applied"):
+                    logger.info(
+                        "[%s] WP-R quality gate: %d revision(s) applied",
+                        file_name, _qmeta["revisions_applied"],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] WP-R quality gate failed (non-fatal): %s",
+                    file_name, exc,
+                )
+
+        # ── Phase 3e: Quality caveat for degraded analyses ──
+        if item.get("analysis_degraded") and report_md.strip():
+            _caveat = (
+                "\n\n> **Quality Note:** The underlying analysis for this "
+                "dataset exited the quality gate in a *degraded* state. "
+                "Some analytical checks could not be fully resolved within "
+                "the iteration budget. Findings should be interpreted with "
+                "appropriate caution and verified against the raw data "
+                "where possible.\n\n"
+            )
+            # Insert after the first heading line
+            _lines = report_md.split("\n", 1)
+            if len(_lines) == 2 and _lines[0].startswith("#"):
+                report_md = _lines[0] + "\n" + _caveat + _lines[1]
+            else:
+                report_md = _caveat + report_md
+            logger.info(
+                "[%s] Injected quality caveat — analysis was degraded",
+                file_name,
+            )
+
         # ── Phase 4: Assembly ──
         logger.info("[%s] Phase 4: Report assembly", file_name)
         if not report_md.strip():
@@ -1266,17 +1565,24 @@ class ReportPipeline:
             report_md, figure_dir, item.get("plots", []),
             figure_selection=self.figure_selection,
             max_figures=self.max_report_figures,
+            analysis_summary=item.get("analysis_summary"),
         )
+
+        # ── Phase 5: Post-assembly validation ──
+        _val = _validate_assembled_report(report_md, label=file_name)
+        report_md = _val["report_md"]
 
         # Write outputs
         md_path = reports_dir / f"{file_name}__report.md"
         md_path.write_text(report_md, encoding="utf-8")
 
+        # Filter plot_paths through image size guard before PDF generation
+        _safe_plots = [p for p in item.get("plots", []) if _image_within_limits(p)]
         pdf_path = _markdown_to_pdf(
             report_md,
             reports_dir / f"{file_name}__report.pdf",
             title=file_name,
-            plot_paths=item.get("plots", []),
+            plot_paths=_safe_plots,
         )
 
         return {
@@ -1348,6 +1654,7 @@ class ReportPipeline:
             "research_context": research_results,
             "knowledge_context": knowledge_context,
             "domain_hints": item.get("domain_hints", {}),
+            "has_ml_modeling": bool(analysis_summary.get("ml_modeling")),
         }
 
         # Build a human-readable listing of existing analysis figures so
@@ -1377,7 +1684,8 @@ class ReportPipeline:
             f"## Workflow\n\n"
             f"1. **VisualisationAgent**: Review existing analysis figures listed above. "
             f"Create enhanced or supplementary figures from the cleaned data at "
-            f"`{cleaned_path}`. Save NEW figures to `{figure_dir}` using the naming "
+            f"`{cleaned_path}`. Save NEW figures to the ABSOLUTE path `{figure_dir}` "
+            f"(use this path exactly — do NOT modify or reconstruct it) using the naming "
             f"convention `fig{{N}}_{{description}}.png` (e.g. fig1_uv_by_column.png). "
             f"Do NOT recreate plots that already exist in the analysis figures — instead, "
             f"focus on creating new visualisations that add analytical value (e.g. "
@@ -1388,7 +1696,14 @@ class ReportPipeline:
             f"figures from VisualisationAgent. Reference figures by their exact filename. "
             f"The report must contain: Title, Executive Summary, Introduction, Materials & "
             f"Methods, Results, Discussion, Conclusions & Recommendations, and References.\n\n"
-            f"When the report is complete, include 'REPORT_COMPLETE' at the end."
+            + (
+                "**Note**: The analysis summary contains ML modelling results "
+                "(ml_modeling key). InterpretationAgent MUST include a Predictive "
+                "Modelling section (section 4b) discussing model performance, feature "
+                "importance, and process predictability insights.\n\n"
+                if analysis_summary.get("ml_modeling") else ""
+            )
+            + f"When the report is complete, include 'REPORT_COMPLETE' at the end."
         )
 
     def _run_groupchat(
@@ -1575,6 +1890,30 @@ class ReportPipeline:
                         "handing off to GlobalInterpretationAgent",
                         vis_turns,
                     )
+                    # WP-R P1-5: Warn if no global figures were generated
+                    if not _figure_manifest_injected:
+                        _has_global_figs = (
+                            global_figure_dir.exists()
+                            and any(global_figure_dir.glob("*.png"))
+                        ) or (
+                            work_dir.exists() and any(work_dir.rglob("*.png"))
+                        )
+                        if not _has_global_figs:
+                            groupchat.messages.append({
+                                "role": "assistant",
+                                "name": "FigureManifest",
+                                "content": (
+                                    "## No Global Figures Generated\n\n"
+                                    "The VisualisationAgent did not produce any cross-file "
+                                    "comparison figures. Do NOT reference any Figure numbers. "
+                                    "Write the report using only the analysis summaries and "
+                                    "individual report excerpts provided."
+                                ),
+                            })
+                            logger.warning(
+                                "Global VisualisationAgent produced 0 figures after %d turns",
+                                vis_turns,
+                            )
                     return interp_agent
                 for msg in reversed(groupchat.messages):
                     if msg.get("name") == vis_agent.name:
@@ -1698,6 +2037,35 @@ class ReportPipeline:
                 len(_exec_global_figs), _n_global,
             )
 
+        # Clean up global exec work_dir after copy-back
+        if work_dir.exists():
+            _shutil_g.rmtree(work_dir, ignore_errors=True)
+            logger.debug("Cleaned up global exec work_dir: %s", work_dir)
+
+        # ── Global WP-R quality gate (post-generation, pre-assembly) ──
+        if report_md.strip() and self._run_config is not None:
+            try:
+                from report_quality import run_report_quality_gate
+                report_md, _gqmeta = run_report_quality_gate(
+                    report_md=report_md,
+                    analysis_summary={},
+                    cleaning_summary={},
+                    run_config=self._run_config,
+                    critic_client=self._critic_client,
+                    critic_model=self._critic_model,
+                    llm_config=self.llm_config,
+                    label="global_report",
+                )
+                if _gqmeta.get("revisions_applied"):
+                    logger.info(
+                        "Global WP-R quality gate: %d revision(s) applied",
+                        _gqmeta["revisions_applied"],
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Global WP-R quality gate failed (non-fatal): %s", exc,
+                )
+
         if report_md:
             # Assemble with global figures
             # BS-1: Pass empty original_plots — the figure_dir scan in
@@ -1710,12 +2078,17 @@ class ReportPipeline:
                 max_figures=self.max_report_figures,
             )
 
+            # Post-assembly validation
+            _gval = _validate_assembled_report(report_md, label="global_report")
+            report_md = _gval["report_md"]
+
             global_md_path = reports_dir / "global_report.md"
             global_md_path.write_text(report_md, encoding="utf-8")
 
             # Use global figures for PDF, not per-file analysis plots
             _global_plot_paths = [
                 str(p) for p in sorted(global_figure_dir.glob("*.png"))
+                if _image_within_limits(str(p))
             ]
             global_pdf_path = _markdown_to_pdf(
                 report_md,
@@ -1920,6 +2293,7 @@ def run_report_pipeline(
     max_groupchat_rounds: int = DEFAULT_MAX_GROUPCHAT_ROUNDS,
     figure_selection: str = "all",
     max_report_figures: int = 10,
+    run_config: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Convenience function to run the report pipeline.
 
@@ -1931,6 +2305,7 @@ def run_report_pipeline(
         max_groupchat_rounds: Max rounds for the GroupChat
         figure_selection: Figure selection strategy ("all", "ranked", "top_n")
         max_report_figures: Max figures when using ranked/top_n
+        run_config: RunConfig object (or dict) with WP-R quality gate toggles
 
     Returns:
         Dict with report paths and metadata
@@ -1945,5 +2320,6 @@ def run_report_pipeline(
         max_groupchat_rounds=max_groupchat_rounds,
         figure_selection=figure_selection,
         max_report_figures=max_report_figures,
+        run_config=run_config,
     )
     return pipeline.run(manifest)

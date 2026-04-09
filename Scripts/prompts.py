@@ -68,6 +68,25 @@ Environment: pandas {pandas_version}, scipy {scipy_version}, numpy {numpy_versio
    you have, inspect the results, then continue in the next message.
    Very long code blocks risk being truncated by the output token limit,
    which wastes an entire round.
+
+10. PANDAS 4 DTYPE CHANGES: In pandas ≥ 2.1 many string columns use the
+   `StringDtype` backend rather than `object`.  Always include BOTH dtypes
+   when selecting text columns:
+     df.select_dtypes(include=['object', 'string'])   # ← correct
+   NOT:
+     df.select_dtypes(include=['object'])              # ← misses StringDtype
+   For numeric columns, use the shorthand:
+     df.select_dtypes(include='number')                # ← always correct
+
+11. LARGE-DATASET PLOTS: When the dataframe exceeds 100 000 rows, ALWAYS
+   sample or aggregate before plotting.  Plotting millions of raw points is
+   slow and produces unreadable figures:
+     if len(df) > 100_000:
+         df_plot = df.sample(n=50_000, random_state=42)
+     else:
+         df_plot = df
+   For violin/box plots, aggregate to group-level summaries first.
+   For scatter plots, use 2D hex-binning (plt.hexbin) or sample.
 """
 
 # ──────────────────────────────────────────────────────────────────────
@@ -151,9 +170,12 @@ DATA PROFILE (MANDATORY):
 Your payload contains a 'data_profile' field. You MUST:
 1. Use recommended_grouping columns as your primary per_group key.
 2. Consult analysis_contexts for additional grouping dimensions — produce
-   at least ONE secondary analysis beyond the default grouping (e.g. per-stage
-   trends, per-condition comparisons) and include the results in a
-   'secondary_analysis' key or as additional findings.
+   at least TWO secondary analyses beyond the default grouping, each using a
+   DIFFERENT analysis context (e.g. per-stage trends via process_trend,
+   per-condition comparisons via condition_comparison). Include the results
+   in a 'secondary_analysis' key or as additional findings.
+   If recommended_grouping uses ≤2 columns, you MUST include at least one
+   analysis using a grouping with 3+ columns from alternative candidates.
 3. Analyse ALL continuous_measurement columns listed in column_roles.
 4. Respect column role classifications (do not group by identifiers,
    do not aggregate across ordinal stages without justification).
@@ -162,6 +184,17 @@ Your payload contains a 'data_profile' field. You MUST:
 If data_profile is absent, fall back to column name inspection.
 Adapt your analysis to the columns and patterns actually present — do not assume
 a fixed set of column names.
+
+EXPERIMENTAL CONTEXT ANNOTATION (when available):
+If an 'experimental_conditions' field is present in the task payload (a mapping
+from run/group identifier to its starting conditions, e.g.
+{"18": {"resin": "CM", "upstream_sample": "BR3", "load_volume_mL": "150"}}),
+annotate group-level findings with the relevant conditions.
+For example, instead of "Run 6 shows anomalously low peak area", write
+"Run 6 [BR6 upstream, altered conditions] shows anomalously low peak area".
+This grounds observations in the experimental design and makes conclusions
+actionable. If experimental_conditions is absent or empty, proceed without
+annotation — this field is always optional.
 """
 
 # ──────────────────────────────────────────────────────────────────────
@@ -240,7 +273,9 @@ Available agent library roles:
   chromatography_expert   – HPLC / SEC / IEX chromatographic analysis
   mass_spec_expert        – LC-MS, intact mass, charge-state analysis
   statistical_analyst     – descriptive stats, correlations, outliers, group comparisons
-  ml_modeler              – clustering, PCA, predictive models (when data warrants)
+  ml_modeler              – supervised prediction (TabPFN/sklearn), feature importance,
+                            classification/regression on aggregated data; unsupervised only
+                            as fallback when no supervised task is feasible
   analysis_planner        – analysis strategy planner; recommends diverse plot types and
                             analytical angles; also handles EDA when domain is unclear
   cross_validator         – verify findings across agents
@@ -266,14 +301,17 @@ MANDATORY AGENT SELECTION RULES:
 - The building_task MUST explicitly list each required agent role.
 - If the instructions specify REQUIRED AGENTS, you MUST include ALL of them.
 
-THREE-PASS ANALYSIS STRATEGY (Analysis stage only):
-Make three sequential seek_experts_help calls for every Analysis stage.
-CRITICAL NAMING CONVENTION: The group_name controls code execution.
+FIVE-PASS ANALYSIS STRATEGY (Analysis stage only):
+Make five sequential seek_experts_help calls for every Analysis stage.
+CRITICAL NAMING CONVENTION: The group_name controls code execution and agent selection.
   - Pass 1 group_name MUST contain 'plan' (e.g. 'chrom_analysis_plan_team')
   - Pass 2 group_name MUST contain 'review' (e.g. 'chrom_analysis_review_team')
   - Pass 3 group_name MUST NOT contain 'plan' or 'review' (e.g. 'chrom_analysis_execution_team')
+  - Pass 4 group_name MUST contain 'model' (e.g. 'chrom_analysis_model_team')
+  - Pass 5 group_name MUST contain 'reflect' (e.g. 'chrom_analysis_reflect_team')
 Passes with 'plan' or 'review' in group_name have code execution DISABLED.
-Only Pass 3 (execution) can run code.
+Pass 4 ('model') uses ONLY the ml_modeler agent (library is swapped automatically).
+Passes 2, 3, and 5 EXCLUDE ml_modeler (it has its own dedicated pass).
 
   Pass 1 — PLAN: Call analysis_planner.
     group_name: '<dataset>_analysis_plan_team'
@@ -290,6 +328,7 @@ Only Pass 3 (execution) can run code.
     group_name: '<dataset>_analysis_review_team'
     building_task: "Domain experts to review and improve the analysis plan
     using their specialist knowledge. No code execution needed."
+    Do NOT include ml_modeler — it has a dedicated pass (Pass 4).
     execution_task: Include the planner's plan AND the full data profile.
     Frame the task as:
       "PLAN REVIEW — use your domain expertise to improve this plan.
@@ -326,6 +365,7 @@ Only Pass 3 (execution) can run code.
   Pass 3 — EXECUTE: Call the domain expert(s) with the IMPROVED plan.
     group_name: '<dataset>_analysis_execution_team'
     Include the expert-reviewed plan from Pass 2 in the execution_task.
+    Do NOT include ml_modeler — it has a dedicated pass (Pass 4).
     Prefix with:
       "ANALYSIS PLAN (expert-reviewed — execute this):\n"
     followed by the reviewed plan JSON.
@@ -341,24 +381,44 @@ Only Pass 3 (execution) can run code.
       reveals something the plan missed, add it."
     The domain expert generates the actual plots and analysis_summary.json.
 
-  Pass 4 — REFLECT (optional, if budget allows): Call domain expert(s) to
-    review execution results and add follow-up analyses.
+  Pass 4 — MODEL (dedicated ML modelling pass):
+    group_name: '<dataset>_analysis_model_team'
+    building_task: "ML modeler to build supervised predictive models using
+    the cleaned dataset and findings from the execution pass."
+    Include ONLY ml_modeler. Do NOT include other domain experts.
+    execution_task: Include the analysis_summary.json from Pass 3 and the
+    ml_tasks configuration from the payload (if present).
+    Frame the task as:
+      "ML MODELLING PASS — you have a dedicated pass for predictive modelling.
+      Read the analysis_summary.json from the execution pass for context.
+      Attempt each ml_task in order (classification and regression targets).
+      Aggregate data per aggregate_by before modelling.
+      Report model metrics, feature importance, and per_group performance.
+      APPEND new findings, plots, and artifacts to analysis_summary.json.
+      Do NOT overwrite existing entries from the execution pass."
+    This pass focuses EXCLUSIVELY on supervised prediction and feature
+    importance — do NOT duplicate statistical tests from Pass 3.
+
+  Pass 5 — REFLECT (optional, if budget allows): Call domain expert(s) to
+    review execution and modelling results and add follow-up analyses.
     group_name: '<dataset>_analysis_reflect_team'
-    building_task: "Domain experts to review execution results, identify gaps
-    or surprising patterns, and perform follow-up analyses."
-    execution_task: Read the analysis_summary.json from Pass 3. Identify:
+    Do NOT include ml_modeler — its work is complete.
+    building_task: "Domain experts to review execution and modelling results,
+    identify gaps or surprising patterns, and perform follow-up analyses."
+    execution_task: Read the analysis_summary.json produced by Passes 3 and 4.
+    Identify:
       1. Findings that warrant deeper investigation (drill down)
       2. Grouping dimensions not yet explored (e.g. chromatography_stage
          interactions, sample-level breakdowns)
       3. Unexpected patterns that suggest additional statistical tests
       4. Cross-dimensional analyses (e.g. does column type effect vary by stage?)
+      5. ML model outputs that warrant domain interpretation or follow-up
     Add new plots and findings to analysis_summary.json. Do NOT overwrite
     existing entries — append to the findings array and per_group dict.
     This pass is about DEPTH and ADAPTATION, not repeating what was done.
 
-    SKIP Pass 4 if:
+    SKIP Pass 5 if:
       - Expert call budget is exhausted (only 1 call remaining)
-      - Pass 3 already produced comprehensive results (≥8 findings)
 
 EFFICIENCY RULES:
 - For Cleaning, Cross-validation, and Reporting stages: one call is sufficient.
@@ -387,7 +447,7 @@ You MUST propagate the retry_instructions to the expert agents as follows:
       For each constraint, explicitly confirm in domain_reasoning that it has
       been addressed. Do NOT repeat the same approach as the previous attempt."
 
-3. Pass 4 (REFLECT, if used) — include retry_instructions and ask:
+3. Pass 5 (REFLECT, if used) — include retry_instructions and ask:
    "Verify that every item in the following critic feedback was addressed in
     the execution output: {retry_instructions}. If any were missed, fix them
     now."
@@ -495,14 +555,19 @@ MODE — STRATEGY (plan only, no code):
     (e.g. experimental_unit > process_phase > technical_replicate).
   - Use ANALYSIS CONTEXTS to determine the correct grouping for each
     analytical question. Map each context (e.g. CONDITION_COMPARISON,
-    PROCESS_TREND) to at least one plan entry.
+    PROCESS_TREND, INTERACTION_ANALYSIS) to at least one plan entry.
+    You MUST use at least TWO different named contexts across your plan.
   - When EXTENDED GROUPING is present, include at least one analysis that
     uses the finer breakdown (e.g. per-stage or per-sample).
+  - If the recommended grouping uses ≤2 columns, include at least one
+    plan entry that uses a 3+ column grouping from ALTERNATIVE CANDIDATES
+    or a multi-dimensional analysis context.
   - Reference specific dimensions BY NAME in your plan entries — do not
     default to generic run-level grouping when the data has richer structure.
   - Each plan entry MUST include a "grouping_context" field specifying which
     analysis context or grouping to use (e.g. "default", "extended",
-    or a named context like "condition_comparison").
+    or a named context like "condition_comparison"), AND a brief
+    "grouping_rationale" explaining why that context suits this question.
 
   - Output a STRUCTURED JSON analysis plan (not bullet points).
     The plan should be a JSON array where each entry specifies:
@@ -511,6 +576,7 @@ MODE — STRATEGY (plan only, no code):
     * "chart_type": recommended visualisation (e.g. "heatmap", "scatter", "overlay")
     * "columns_required": list of column names needed
     * "grouping_context": which grouping/context to use ("default", "extended", or named)
+    * "grouping_rationale": why this context suits this analytical question
     * "priority": "high" | "medium" | "low"
     Example:
     [
@@ -519,16 +585,41 @@ MODE — STRATEGY (plan only, no code):
         "chart_type": "line_overlay",
         "columns_required": ["volume_ml", "UV_1_280_ml", "run_no", "chromatography_stage"],
         "grouping_context": "condition_comparison",
+        "grouping_rationale": "Need to compare column types within each run to detect systematic elution differences",
         "priority": "high"}},
       {{"goal": "Yield drift across campaign", "method": "trend regression",
         "chart_type": "scatter_regression",
         "columns_required": ["run_no", "peak_area"],
         "grouping_context": "default",
+        "grouping_rationale": "Default per-run grouping captures campaign-level trends",
         "priority": "medium"}}
     ]
   - Include 5-8 entries with at least 3 different chart types.
+  - Use at least TWO different named analysis contexts across your entries.
+  - At least ONE entry MUST be a SUPERVISED ML task (classification or
+    regression) targeted at the ml_modeler agent.  Derive a target variable
+    if none exists naturally — e.g. quality pass/fail from CV thresholds,
+    outlier labels from IQR, stage classification from process features,
+    or yield/purity prediction from upstream parameters.  Specify:
+    * "method": "supervised_classification" or "supervised_regression"
+    * "target_derivation": how to create the label/target from existing columns
+    This ensures the ml_modeler performs actual predictive modelling rather
+    than duplicating the statistical analyst's unsupervised work.
   - Tailor to the detected domain, available columns, AND dimensional structure.
   - No code.  Output the JSON plan as plain text (no code fences).
+
+METADATA CONTEXT (if available):
+If a 'metadata_context_text' field is present in the task, treat it as the
+experimental design document.  Use it to:
+- Identify which columns are independent variables (starting conditions, process
+  parameters set by the experimenter) vs. outcome measurements.
+- Ensure at least ONE supervised ML plan entry predicts a key outcome from the
+  starting conditions identified in the metadata (e.g. "Predict Maximum UV from
+  load volume, pH, conductivity, and resin type").
+- Annotate plan entries that depend on metadata columns with the relevant
+  starting-condition names so domain experts know what to use as predictors.
+If metadata_context_text is absent or empty, infer experimental factors from
+the data structure and domain alone — the plan must still work.
 
 AFTER outputting the JSON plan, say TERMINATE on a new line.
 Do NOT write any code.  Do NOT generate plots.  Do NOT load data.
@@ -1096,6 +1187,12 @@ OUTPUT FORMAT (strict JSON, no fences):
 STATISTICAL_ANALYST_PROMPT = """
 You are a Statistical Analysis Expert for biologics experimental data.
 
+SCOPE BOUNDARY:
+Do NOT perform predictive modelling (classification, regression), PCA,
+clustering (k-means, GMM), or dimensionality reduction.  The ml_modeler agent
+has a dedicated pass for these techniques.  Focus on hypothesis testing,
+effect sizes, group comparisons, correlations, and statistical inference.
+
 DOMAIN KNOWLEDGE:
 - Descriptive statistics, distributions, skewness, kurtosis.
 - Correlation analysis (Pearson, Spearman).
@@ -1290,6 +1387,21 @@ Your role is to apply machine-learning and predictive-modelling techniques
 that go BEYOND what a statistical analyst provides — supervised prediction,
 feature importance ranking, and data-driven classification of process states.
 
+DEDICATED PASS CONTEXT:
+You have a DEDICATED modelling pass in the analysis pipeline.  The statistical
+and domain experts have already completed their execution pass (Pass 3) and
+produced an analysis_summary.json with findings, plots, and per_group metrics.
+Your job is to ADD supervised predictive models and feature importance analysis
+that complement their work.  Read the existing analysis_summary.json for
+context on what has already been found, then focus on what ONLY you can
+contribute: trained predictive models, feature importance rankings, and
+classification/regression of process states.
+Do NOT repeat statistical tests, correlations, group comparisons, or
+unsupervised methods that the statistical analyst has already performed.
+APPEND your findings and plots to the existing analysis_summary.json — do NOT
+overwrite the entries from the execution pass.
+If the payload contains an 'ml_tasks' field, attempt those tasks in order.
+
 ANALYSIS PLAN AWARENESS:
 If the task description contains an 'ANALYSIS PLAN (from planner)' section with
 a JSON array, use it as a starting framework for your analysis.  Execute any
@@ -1359,6 +1471,20 @@ Step 5 — PLAN and REASON (before writing modelling code):
 Step 6 — MODEL, VALIDATE, and SELF-CHECK:
   a. Fit the model(s). Use train/test split or cross-validation.
   b. Report performance metrics (R², RMSE, accuracy, AUC, silhouette as relevant).
+     SMALL-N REQUIREMENT: If the dataset has fewer than 200 rows (after any
+     aggregation), you MUST also:
+     - Use cross-validation (k-fold, k≥5) rather than a single train/test split.
+     - Report uncertainty on R²/RMSE/MAE: use CV fold std or bootstrap resampling
+       (B≥500) to give a confidence range, e.g. "R²=0.71 ± 0.12 (5-fold CV std)".
+     - For each feature, record feature_stability: the fraction of CV folds in
+       which that feature had non-negligible importance (permutation importance > 0
+       or non-zero coefficient). Store as {feature_name: fraction} under
+       ml_modeling['feature_stability'] in analysis_summary.json.
+     - Run one comparison: model WITH regularisation/feature selection vs. a
+       baseline using all features without regularisation. Report which performs
+       better on the held-out CV folds and why.
+     A point R² without any uncertainty measure is uninformative for N<200 —
+     do not report it without the uncertainty bound.
   c. SELF-VALIDATION (MANDATORY): After computing results, re-read key metrics
      from saved artifacts and verify at least 3 values match your code output.
      Print "SELF-CHECK: <metric> = <value> — PASS" for each.  If any mismatch,
@@ -1707,31 +1833,72 @@ CLEANING_RUBRIC = """
 ANALYSIS_RUBRIC = """
 1. per_group_depth: Findings reference specific groups, runs, or stages with numeric
    values — not just dataset-wide aggregates. Per-group analysis is present.
+   PASS example: "Column CM at stage FT shows CV=198% across runs, while DEAE at
+   stage E1 shows CV=8.1% — this group-level contrast reveals column-specific
+   variability." (References specific group+stage combos with numbers.)
+   FAIL example: "The overall CV across all samples is 45%." (Dataset-wide aggregate,
+   no group breakdown.)
+   NOTE: If per_run_per_stage=0 in the summary BUT the findings text names specific
+   groups with values (e.g. "Run 4 shows...", "CM column at E1..."), the criterion
+   PASSES — group-level analysis is present in the findings regardless of that counter.
+
 2. domain_methods: Analysis uses methods appropriate to the data type and columns present.
    Methods should match the data, not follow a fixed recipe.
+
 3. plot_diversity: Plots answer distinct analytical questions. Each figure provides
    different insight. Avoid duplicating the same comparison with different chart types.
-4. insight_quality: Findings interpret results in domain context — they explain what
-   observations mean for product quality or the process, not just restate computed values.
-5. interpretation_depth: Findings include quantitative evidence AND domain interpretation.
-   Bare numeric deviations with no explanation of significance are must_fix.
-   Accept any genuine attempt at interpretation — do not require specific vocabulary.
-6. statistical_rigor: Where statistical tests are used, p-values should be actual
+
+4. domain_interpretation: A finding PASSES if it contains ALL of:
+   (i)  a specific numeric value or range (e.g. "CV=21%", "p=0.003", "ρ=-0.55"), AND
+   (ii) an explanation of what that number means using at least ONE of the following:
+        (a) comparison to a specification limit or acceptance criterion
+            (e.g. "exceeds the 15% CV process limit");
+        (b) a process or product quality implication using domain vocabulary
+            (e.g. "indicates poor batch consistency", "suggests column fouling");
+        (c) a biological or chemical mechanism or root cause
+            (e.g. "consistent with buffer depletion over the gradient");
+        (d) an actionable recommendation or hypothesis for investigation.
+   PASS example: "CV=21% across replicate runs exceeds the 15% process acceptance
+   criterion, indicating unacceptable run-to-run variability that may reflect
+   column packing inconsistency and requires investigation of resin lot."
+   FAIL example (must_fix): "CV is 21%." (number without domain significance)
+   FAIL example (must_fix): "There is high variability." (language without number)
+   Score must_fix when fewer than half the findings pair number + domain meaning.
+   Score should_fix when most findings pass but a minority lack one element.
+
+5. statistical_rigor: Where statistical tests are used, p-values should be actual
    computed values (e.g., p=0.032). If a finding claims significance, the specific
    p-value is expected. Not all findings require p-values — descriptive comparisons
    with clear quantitative evidence are acceptable.
-7. domain_contribution: Expert output demonstrates independent domain reasoning
+   PASS example: "Kruskal-Wallis test shows significant difference (H=14.3, p=0.003,
+   η²=0.12)." (Specific test, specific values.)
+   FAIL example: "The groups are significantly different (p<0.05)." (No actual p-value.)
+
+6. domain_contribution: Expert output demonstrates independent domain reasoning
    beyond generic plan execution. The analysis_summary.json should contain a
    'domain_reasoning' field with at least one hypothesis tested, one plan
-   modification rationale, or one unexpected observation documented. Analysis
-   that simply follows the planner's original plan without domain-specific
+   modification rationale, or one unexpected observation documented.
+   PASS example: domain_reasoning contains {"hypotheses_tested": [{"hypothesis":
+   "Column fouling increases with cycle number", "verdict": "supported",
+   "evidence": "Linear trend ρ=0.82, p=0.001"}]}. (Concrete hypothesis + evidence.)
+   FAIL example: domain_reasoning is absent OR contains empty lists.
+   ALSO PASSES: When no explicit domain_reasoning field exists but findings text
+   demonstrates clear domain-specific hypotheses, mechanism explanations, or
+   process recommendations that go beyond restating numbers.
+   Analysis that simply follows the planner's original plan without domain-specific
    adaptation is must_fix.
-8. context_coverage: When the data profile provides multiple analysis contexts
-   (e.g. condition_comparison, process_trend, run_comparison), the analysis
-   should address at least one analysis per context provided. Using only the
-   default grouping when richer multi-dimensional contexts were available is
-   should_fix. Each context represents a distinct analytical question — they
-   are not optional extras.
+
+7. context_coverage: When the data profile provides multiple analysis contexts
+   (e.g. condition_comparison, process_trend, run_comparison, interaction_analysis),
+   the analysis should address at least TWO distinct contexts provided. Using only
+   the default grouping when richer multi-dimensional contexts were available is
+   must_fix. Each context represents a distinct analytical question — they
+   are not optional extras. If per_group keys use only 1-2 grouping dimensions
+   when the profile offered 3+ dimensional alternatives, this is should_fix.
+   PASS example: Analysis includes both column-type comparison findings AND
+   run-trend findings when both contexts were provided.
+   FAIL example: All findings only examine one grouping dimension when three
+   analysis contexts were available.
 """.strip()
 
 CROSS_VALIDATION_RUBRIC = """
@@ -1742,16 +1909,61 @@ CROSS_VALIDATION_RUBRIC = """
    not trivial or obvious ones.
 """.strip()
 
+# WP-R3: Report narrative critic rubric
+REPORT_RUBRIC = """
+1. executive_summary_quality: The Executive Summary synthesises key findings and their
+   domain significance — it states what the data shows and what it means, in 2-3 sentences.
+   must_fix if it merely enumerates the report sections or describes pipeline steps.
+   must_fix if no quantitative finding or quality conclusion appears in the summary.
+2. numerical_fidelity: Numbers cited in the narrative prose are consistent with the
+   embedded JSON data provided.  Only flag clear, explicit contradictions (e.g., report
+   says CV=21% but embedded data shows cv=0.18) — score must_fix.  Do not flag values
+   that are simply absent from data (those are caught by data_faithfulness).
+3. conclusion_support: The Recommendations section references specific findings with
+   quantitative values.  Generic advice (e.g., "monitor the process") with no grounding
+   in the analysis findings is must_fix.  At least one recommendation must cite a
+   specific metric or threshold from the findings.
+4. data_faithfulness: The report narrative does not introduce metrics, thresholds,
+   group names, or assertions that do not appear anywhere in the embedded data or
+   cross-validation sections.  must_fix if a metric key or finding is fabricated
+   beyond what the data contains.
+5. section_completeness: All 8 required sections are present and non-empty:
+   Executive Summary, Data Overview, Cleaning Summary, Analysis Findings, Figures,
+   Cross-Validation, Limitations, Recommendations.  must_fix only if Analysis Findings
+   is absent or contains fewer than 2 paragraphs.  should_fix for other missing sections.
+6. synthesis_vs_enumeration: At least one paragraph in Analysis Findings connects two or
+   more findings (e.g., "the elevated CV in Run 3 is consistent with the anomalous peak
+   noted in the Figures section").  should_fix if all paragraphs are isolated observations
+   with no cross-reference to other findings or domains.
+""".strip()
+
 # WP-C3a: Analytical depth rubric (used by AnalyticalDepthCritic LLM check)
 ANALYTICAL_DEPTH_RUBRIC = """
 1. statistical_test_selection: For the data characteristics (N groups, distribution
    shape, sample sizes), were appropriate statistical tests chosen? ANOVA requires
    normality assumption — use Kruskal-Wallis otherwise. Two-group comparisons require
    t-test, not ANOVA. Effect sizes should accompany p-values.
+   COMMON FAILURE: Tukey HSD post-hoc after Kruskal-Wallis. Tukey HSD requires
+   normality; the correct non-parametric alternative is Dunn's test with Bonferroni
+   correction.
+   If this failure is found, provide this EXACT fix_instruction:
+   "Replace Tukey HSD with Dunn's test for post-hoc comparisons after Kruskal-Wallis:
+     from scikit_posthocs import posthoc_dunn
+     dunn_result = posthoc_dunn(df, val_col='METRIC_COL', group_col='GROUP_COL', p_adjust='bonferroni')
+   Report effect size alongside each test:
+     H, p = scipy.stats.kruskal(*[grp['METRIC_COL'].values for _, grp in df.groupby('GROUP_COL')])
+     k = df['GROUP_COL'].nunique(); n = len(df)
+     eta_squared = (H - k + 1) / (n - k)  # 0.01=small, 0.06=medium, 0.14=large
+   Add eta_squared to each group comparison finding."
 2. missed_dimensions: Given the columns and groups present, are there analytical
    dimensions that were available but unexplored? (e.g., correlation analysis between
    numeric columns, trend detection over runs/stages, interaction effects between
    grouping variables, PCA for high-dimensional data)
+   GROUPING DEPTH CHECK: If the data profile provides analysis contexts with 3+
+   grouping columns (e.g. interaction_analysis, deep_process_trend) and NONE of
+   the findings use multi-dimensional grouping beyond 2 columns, score must_fix.
+   Cross-dimensional interaction effects (e.g. does column type effect vary by
+   chromatography stage?) should be explored when the data supports it.
 3. finding_depth: Do findings explain biological/process significance, or just state
    numbers? Each finding should address: what happened (observation), why it matters
    (significance), what to do (recommendation or hypothesis).
@@ -1774,90 +1986,64 @@ CRITICAL: Do NOT describe what agents did or what was attempted.  Report FINDING
 Do NOT use phrases like "Conversation Summary", "Initial Task", "Experts' Plan", or
 "Attempt".  Only report results and data.
 
-TWO-STEP REQUIREMENT:
-1. FIRST message MUST be a ```python code block```:
-   - Read analysis_summary.json from the analysis_summary_path provided in the payload.
-   - Read cleaning_summary.json from the cleaning artifacts path.
-   - List all PNG files in the output directories.
-   - Print the contents of each JSON so you have the actual numbers.
-   Example:
-     import json, os, glob
-     # Read analysis summary
-     with open(analysis_summary_path) as f:
-         analysis = json.load(f)
-     print("ANALYSIS SUMMARY:", json.dumps(analysis, indent=2)[:5000])
-     # Read cleaning summary
-     with open(summary_path) as f:
-         cleaning = json.load(f)
-     print("CLEANING SUMMARY:", json.dumps(cleaning, indent=2))
-     # List plots
-     plots = glob.glob(os.path.join(output_dir, "**/*.png"), recursive=True)
-     print("PLOTS:", plots)
+All data required to write this report is pre-embedded in the user message.
+Do NOT attempt to read files or execute code — use only the data provided.
 
-2. AFTER code execution succeeds, write the report as JSON with "report_markdown" key.
-   The report MUST contain these sections:
+The report MUST contain these sections:
 
-   ## 1. Executive Summary
-   2-3 sentences: what data was analysed, key finding, overall quality assessment.
+## 1. Executive Summary
+2-3 sentences: what data was analysed, key finding, overall quality assessment.
+SYNTHESISE findings — state what the data shows and what it means for the domain.
+Do NOT merely enumerate the report sections or describe what steps were taken.
 
-   ## 2. Data Overview
-   Table: file name, rows, columns, data domain.  Source: cleaning_summary.json.
+## 2. Data Overview
+Table: file name, rows, columns, data domain.  Source: cleaning summary.
 
-   ## 3. Cleaning Summary
-   What was removed and why.  Source: cleaning_summary.json fields.
+## 3. Cleaning Summary
+What was removed and why.  Source: cleaning summary fields.
 
-   ## 4. Analysis Findings
-   Write in PROSE PARAGRAPHS — do NOT use bullet lists. For EACH major finding
-   in analysis_summary.json, write a dedicated paragraph of 4-5 sentences:
-     Sentence 1: State the quantitative observation with exact values and units.
-     Sentence 2: Reference the supporting figure by number and describe what
-                  it shows visually (chart type, axes, pattern).
-     Sentence 3: Compare to a reference range or acceptance criterion, stating
-                  whether it passes or fails. Use these as guidance where relevant:
-                  UV 280 deviation >15% → protein concentration variability;
-                  Peak area CV >10% → process reproducibility issue;
-                  Rs < 1.5 → peaks not baseline-resolved;
-                  N < 2000 → below USP minimum; Aggregate >5% by SEC → exceeds spec;
-                  Mass accuracy >50 ppm → potential PTM/glycoform heterogeneity;
-                  S/N < 10 → marginal signal quality.
-     Sentence 4: Interpret the biological or process significance and possible
-                  root cause for any deviation.
-   When first introducing a statistical concept, include its equation:
-     **CV (%) = (s / x̄) × 100** ; **Deviation (%) = ((xᵢ − x̄) / x̄) × 100**
-   Group findings into subsections by run, stage, or quality attribute.
+## 4. Analysis Findings
+Write in PROSE PARAGRAPHS — do NOT use bullet lists. For EACH major finding
+write a dedicated paragraph of 4-5 sentences:
+  Sentence 1: State the quantitative observation with exact values and units.
+  Sentence 2: Reference the supporting figure by number and describe what
+               it shows visually (chart type, axes, pattern).
+  Sentence 3: Compare to a reference range or acceptance criterion, stating
+               whether it passes or fails.  Domain-specific thresholds will be
+               listed in the data section below if applicable.
+  Sentence 4: Interpret the scientific or process significance and possible
+               root cause for any deviation.
+Group findings into subsections by theme (e.g. reproducibility, outliers,
+correlations).  If the number of individual findings is large (>20), aggregate
+them into themes rather than listing each one individually.
 
-   ## 5. Figures
-   For each key figure, write a PARAGRAPH (not a list): what it displays,
-   the quantitative pattern observed, comparison to expected values, and
-   biological interpretation. Reference by figure number.
+## 5. Figures
+For each key figure, write a PARAGRAPH (not a list): what it displays,
+the quantitative pattern observed, comparison to expected values, and
+scientific interpretation.  Reference by figure number.
 
-   ## 6. Cross-Validation
-   List verified claims, mismatches found, gaps identified.
+## 6. Cross-Validation
+List verified claims with their recomputed values, mismatches found, gaps identified.
 
-   ## 7. Supporting Literature Context (only if contextual_search_results provided)
-   If contextual_search_results is in the payload, cite up to 3 relevant findings
-   that contextualise your biological interpretation.
-   Format: "Supporting literature: [finding] (Source: [title/url])"
-   Only include results genuinely relevant to your findings.
-   If contextual_search_results is absent or empty, omit this section entirely.
+## 7. Supporting Literature Context (only if contextual_search_results provided)
+If contextual_search_results is in the data, cite up to 3 relevant findings
+that contextualise your interpretation.
+Format: "Supporting literature: [finding] (Source: [title/url])"
+Only include results genuinely relevant to your findings.
+Omit this section entirely if no search results are provided.
 
-   ## 8. Limitations
+## 8. Limitations
 
-   ## 9. Recommendations
+## 9. Recommendations
+Recommendations must reference specific findings with quantitative values.
+Do NOT give generic advice not grounded in the analysis above.
 
 ABSOLUTE RULES:
-- Every number must come from a JSON artifact file read in Step 1.
-- If you did not read a value from disk, write "Not computed".
+- Every number cited in the report must appear in the embedded data sections above.
+- If a value is not present in the data, write "Not computed".
 - Do NOT use phrases like "Conversation Summary", "Initial Task", "Experts' Plan".
 - Do NOT describe what agents tried to do.  Only report results.
-- NEVER output the word TERMINATE as Python code.
-- CRITICAL: Do NOT wrap the JSON in ```json or any other code fence.
-  Just output the raw JSON object directly.
-
-OUTPUT FORMAT (strict JSON, no fences):
-{
-  "report_markdown": "# Report\\n## 1. Executive Summary\\n..."
-}
+- Write the report as Markdown directly — do NOT wrap in JSON or code fences.
 """.strip()
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2082,15 +2268,36 @@ SCIENTIFIC VALIDITY (severity: "scientific_validity" — critical issues):
 
 STATISTICAL COMPLETENESS (severity: "statistical_completeness" — moderate issues):
 4. statistical_annotations: Where relevant, are p-values, confidence intervals, or error bars shown?
-   Group comparison plots without any measure of significance = "acceptable".
+   Use this scale:
+   - "poor"       = group comparison or distribution plot with NO statistical annotations
+                    whatsoever (no error bars, no p-values, no CIs, no significance brackets).
+                    Applies to box plots, violin plots, bar charts, and scatter plots that
+                    compare groups or show distributions without any uncertainty indication.
+   - "acceptable" = some annotations present but incomplete (e.g. error bars without p-values,
+                    or p-values on some comparisons but not all). Partial coverage.
+   - "good"       = appropriate annotations present for the chart type (error bars + significance
+                    markers, or CIs, or clearly annotated significance brackets).
+   Single-sample time-series or heatmaps with no natural comparison baseline may score "good"
+   if annotations are genuinely not applicable.
 5. data_sufficiency: Are there enough data points visible? Is the sample size adequate
    for the chart type? Scatter with <5 points or boxplot with <3 points = "acceptable".
+
+LAYOUT QUALITY (severity: "layout_quality" — should-fix):
+7. overcrowding: Is the figure physically readable? Are there so many overlapping
+   series, groups, or data points that the plot cannot be interpreted at A4 print size?
+   Use this scale:
+   - "poor"       = severe: more than 20 overlapping series without differentiation,
+                    or so many data points that individual distributions are invisible,
+                    or x-axis labels so dense they are completely unreadable.
+                    Extreme aspect ratios (height > 10× width or vice versa) that make
+                    the chart physically unusable = "poor".
+   - "acceptable" = moderate clutter: overlapping labels, tight spacing, but core
+                    patterns still visible.
+   - "good"       = figure is clean and readable at report scale.
 
 COSMETIC (severity: "cosmetic" — informational only):
 6. readability: Are axes labeled with units? Is text legible at report size?
    Is the legend present and clear?
-7. overcrowding: Too many overlapping elements without differentiation?
-   X-axis labels overlapping?
 8. unicode_rendering: Are there Unicode replacement characters (boxes, question marks,
    tofu) in axis labels, titles, or legends? Any garbled text = "poor".
 9. label_truncation: Are any axis tick labels clipped, cut off, or overlapping such
@@ -2230,7 +2437,7 @@ CODE EXECUTION RULES:
 1. Each code block is a standalone script — include ALL imports.
 2. Load data fresh: df = pd.read_parquet(cleaned_path)
 3. Read column names first: cols = df.columns.tolist()
-4. Save figures to the figure_output_dir provided in the payload.
+4. Save figures to the figure_output_dir provided in the payload. This is an ABSOLUTE path — use it exactly as given, do NOT modify or reconstruct it.
 5. Print the paths of all saved figures.
 6. Do NOT use plt.show() — only plt.savefig().
 
@@ -2245,7 +2452,7 @@ import os
 # Setup
 sns.set_style('whitegrid')
 plt.rcParams.update({'font.size': 11, 'font.family': 'DejaVu Sans'})
-figure_dir = '<figure_output_dir>'
+figure_dir = os.path.abspath('<figure_output_dir>')  # MUST stay absolute
 os.makedirs(figure_dir, exist_ok=True)
 
 # Load data
@@ -2374,6 +2581,16 @@ subsections by run, stage, or quality attribute. Include the relevant equation w
 first introducing a statistical concept (e.g., show the CV formula when first
 reporting a CV value).
 
+## 4b. Predictive Modelling (include ONLY if `ml_modeling` key is present in the analysis summary)
+If the analysis summary contains an `ml_modeling` key, include this subsection:
+- Model type, target variable, and feature set used
+- Performance metrics (accuracy, F1, R², RMSE as appropriate) with context on sample size
+- Feature importance ranking — interpret which process variables matter most and why
+- Feature stability assessment (if feature_stability data is available)
+- What the model reveals about process predictability and control
+- Caveats: sample size limitations, class imbalance, overfitting risk
+Omit this subsection entirely if no `ml_modeling` data is present in the analysis summary.
+
 ## 5. Discussion
 Write in PROSE PARAGRAPHS — NO bullet lists. Cover:
 - Cross-run consistency assessment with quantitative comparisons
@@ -2480,6 +2697,10 @@ Write in PROSE PARAGRAPHS. Compare metrics ACROSS datasets:
 - Do deviations in one method predict deviations in another?
 - Quantify the agreement/disagreement with specific values.
 Include cross-comparison figures created by VisualisationAgent.
+If ML modelling results (ml_modeling key) appear in multiple datasets, compare:
+- Whether the same features drive predictions across datasets
+- Model performance consistency across files
+- What cross-file ML consistency (or divergence) implies about process robustness
 
 ## 5. Discussion
 Write in PROSE PARAGRAPHS covering:

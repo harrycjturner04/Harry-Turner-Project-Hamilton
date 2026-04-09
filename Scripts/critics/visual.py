@@ -42,4 +42,5 @@ class VisualCritic(CriticModule):
     def evaluate(self, ctx: CriticContext) -> List[CheckResult]:
         return self._pipeline._run_plot_quality_evaluator(
             ctx.listing, ctx.label,
+            skip_plots=ctx.exhausted_plots or None,
         )
